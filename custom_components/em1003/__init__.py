@@ -63,7 +63,7 @@ async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str |
             BleakClient,
             device,
             mac_address,
-            disconnected_callback=lambda: None,
+            disconnected_callback=lambda _: None,
             max_attempts=3,
         )
 
@@ -176,7 +176,7 @@ class EM1003Device:
                 BleakClient,
                 device,
                 self.mac_address,
-                disconnected_callback=lambda: None,
+                disconnected_callback=lambda _: None,
                 max_attempts=3,
             )
 
@@ -340,7 +340,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 BleakClient,
                 device,
                 mac_address,
-                disconnected_callback=lambda: None,
+                disconnected_callback=lambda _: None,
                 max_attempts=3,
             )
 
@@ -409,7 +409,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 BleakClient,
                 device,
                 mac_address,
-                disconnected_callback=lambda: None,
+                disconnected_callback=lambda _: None,
                 max_attempts=3,
             )
 
@@ -449,7 +449,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 BleakClient,
                 device,
                 mac_address,
-                disconnected_callback=lambda: None,
+                disconnected_callback=lambda _: None,
                 max_attempts=3,
             )
 
@@ -509,7 +509,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 BleakClient,
                 device,
                 mac_address,
-                disconnected_callback=lambda: None,
+                disconnected_callback=lambda _: None,
                 max_attempts=3,
             )
 
