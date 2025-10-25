@@ -6,6 +6,7 @@ import logging
 
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
+from bleak_retry_connector import establish_connection
 
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
@@ -58,7 +59,15 @@ async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str |
             _LOGGER.warning("Device not found when reading name: %s", mac_address)
             return None
 
-        async with BleakClient(device, timeout=DEVICE_TIMEOUT) as client:
+        client = await establish_connection(
+            BleakClient,
+            device,
+            mac_address,
+            disconnected_callback=lambda: None,
+            max_attempts=3,
+        )
+
+        try:
             _LOGGER.debug("Connected to device %s to read name", mac_address)
 
             # Read the Device Name characteristic (0x2A00)
@@ -67,6 +76,8 @@ async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str |
 
             _LOGGER.info("Read device name from %s: %s", mac_address, device_name)
             return device_name
+        finally:
+            await client.disconnect()
 
     except BleakError as err:
         _LOGGER.error("Bleak error reading device name from %s: %s", mac_address, err)
@@ -161,7 +172,15 @@ class EM1003Device:
                 _LOGGER.error("Device not found: %s", self.mac_address)
                 return None
 
-            async with BleakClient(device, timeout=DEVICE_TIMEOUT) as client:
+            client = await establish_connection(
+                BleakClient,
+                device,
+                self.mac_address,
+                disconnected_callback=lambda: None,
+                max_attempts=3,
+            )
+
+            try:
                 _LOGGER.debug("Connected to device %s", self.mac_address)
 
                 # Subscribe to notifications
@@ -195,6 +214,8 @@ class EM1003Device:
 
                 # Return parsed value
                 return self.sensor_data.get(sensor_id)
+            finally:
+                await client.disconnect()
 
         except BleakError as err:
             _LOGGER.error("Bleak error reading sensor %02x: %s", sensor_id, err)
@@ -315,7 +336,15 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 _LOGGER.error("Device not found: %s", mac_address)
                 return
 
-            async with BleakClient(device, timeout=DEVICE_TIMEOUT) as client:
+            client = await establish_connection(
+                BleakClient,
+                device,
+                mac_address,
+                disconnected_callback=lambda: None,
+                max_attempts=3,
+            )
+
+            try:
                 _LOGGER.info("✓ Connected to device")
 
                 # Get all services
@@ -353,6 +382,8 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                             _LOGGER.info("      Descriptors:")
                             for desc in char.descriptors:
                                 _LOGGER.info("        - UUID: %s, Handle: %s", desc.uuid, desc.handle)
+            finally:
+                await client.disconnect()
 
         except BleakError as err:
             _LOGGER.error("Bleak error during discovery: %s", err, exc_info=True)
@@ -374,7 +405,15 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 _LOGGER.error("Device not found: %s", mac_address)
                 return
 
-            async with BleakClient(device, timeout=DEVICE_TIMEOUT) as client:
+            client = await establish_connection(
+                BleakClient,
+                device,
+                mac_address,
+                disconnected_callback=lambda: None,
+                max_attempts=3,
+            )
+
+            try:
                 _LOGGER.info("✓ Connected to device")
 
                 services = client.services
@@ -384,6 +423,8 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     _LOGGER.info("  UUID: %s", service.uuid)
                     _LOGGER.info("  Description: %s", service.description)
                     _LOGGER.info("  Characteristics count: %d", len(service.characteristics))
+            finally:
+                await client.disconnect()
 
         except Exception as err:
             _LOGGER.error("Error listing services: %s", err, exc_info=True)
@@ -404,7 +445,15 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 _LOGGER.error("Device not found: %s", mac_address)
                 return
 
-            async with BleakClient(device, timeout=DEVICE_TIMEOUT) as client:
+            client = await establish_connection(
+                BleakClient,
+                device,
+                mac_address,
+                disconnected_callback=lambda: None,
+                max_attempts=3,
+            )
+
+            try:
                 _LOGGER.info("✓ Connected to device")
 
                 value = await client.read_gatt_char(char_uuid)
@@ -419,6 +468,8 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     _LOGGER.info("  Value (utf-8): %s", value.decode('utf-8'))
                 except:
                     pass
+            finally:
+                await client.disconnect()
 
         except Exception as err:
             _LOGGER.error("Error reading characteristic: %s", err, exc_info=True)
@@ -454,7 +505,15 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             else:
                 data_bytes = data
 
-            async with BleakClient(device, timeout=DEVICE_TIMEOUT) as client:
+            client = await establish_connection(
+                BleakClient,
+                device,
+                mac_address,
+                disconnected_callback=lambda: None,
+                max_attempts=3,
+            )
+
+            try:
                 _LOGGER.info("✓ Connected to device")
 
                 await client.write_gatt_char(char_uuid, data_bytes)
@@ -463,6 +522,8 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 _LOGGER.info("  Characteristic: %s", char_uuid)
                 _LOGGER.info("  Data written (hex): %s", data_bytes.hex())
                 _LOGGER.info("  Data written (bytes): %s", list(data_bytes))
+            finally:
+                await client.disconnect()
 
         except Exception as err:
             _LOGGER.error("Error writing characteristic: %s", err, exc_info=True)
