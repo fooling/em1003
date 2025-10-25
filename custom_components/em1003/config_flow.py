@@ -77,11 +77,29 @@ class EM1003ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # Get list of discovered Bluetooth devices
         discovered_devices = async_discovered_service_info(self.hass)
 
-        schema = vol.Schema(
-            {
-                vol.Required(CONF_MAC_ADDRESS): str,
-            }
-        )
+        # Build dropdown options from discovered devices
+        device_options = {}
+        if discovered_devices:
+            for device in discovered_devices:
+                # Create a friendly display name with device name and MAC address
+                device_name = device.name or "Unknown Device"
+                mac_address = device.address
+                display_name = f"{device_name} ({mac_address})"
+                device_options[mac_address] = display_name
+
+        # Create schema with dropdown if devices found, otherwise text input
+        if device_options:
+            schema = vol.Schema(
+                {
+                    vol.Required(CONF_MAC_ADDRESS): vol.In(device_options),
+                }
+            )
+        else:
+            schema = vol.Schema(
+                {
+                    vol.Required(CONF_MAC_ADDRESS): str,
+                }
+            )
 
         return self.async_show_form(
             step_id="user",
