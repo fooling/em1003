@@ -128,6 +128,18 @@ class EM1003Sensor(CoordinatorEntity, SensorEntity):
                 SensorDeviceClass, sensor_info["device_class"].upper(), None
             )
 
+        # Set precision based on sensor type
+        if sensor_id == 0x01:  # Temperature
+            self._attr_suggested_display_precision = 2
+        elif sensor_id == 0x06:  # Humidity
+            self._attr_suggested_display_precision = 1
+        elif sensor_id == 0x0A:  # Formaldehyde
+            self._attr_suggested_display_precision = 3
+        elif sensor_id == 0x12:  # TVOC
+            self._attr_suggested_display_precision = 3
+        else:  # Other sensors (no decimals)
+            self._attr_suggested_display_precision = 0
+
     @property
     def device_info(self) -> DeviceInfo:
         """Return device information about this EM1003 device."""

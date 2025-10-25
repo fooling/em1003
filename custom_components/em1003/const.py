@@ -29,35 +29,35 @@ EM1003_NOTIFY_CHAR_UUID = "0000FFF4-0000-1000-8000-00805F9B34FB"  # Notify chara
 # Protocol Commands
 CMD_READ_SENSOR = 0x06  # Command to read sensor data
 
-# Sensor IDs (confirmed through testing)
-SENSOR_ID_01 = 0x01  # Unknown - not yet identified
-SENSOR_ID_06 = 0x06  # Unknown - not yet identified
+# Sensor IDs (all confirmed through testing)
+SENSOR_ID_01 = 0x01  # ✓ Confirmed: Temperature (°C) - formula: (raw - 4000) / 100
+SENSOR_ID_06 = 0x06  # ✓ Confirmed: Humidity (%) - formula: raw / 100
 SENSOR_ID_08 = 0x08  # ✓ Confirmed: Noise Level (dB)
 SENSOR_ID_09 = 0x09  # ✓ Confirmed: PM2.5 (µg/m³)
-SENSOR_ID_0A = 0x0A  # Unknown - not yet identified
+SENSOR_ID_0A = 0x0A  # ✓ Confirmed: Formaldehyde (mg/m³) - formula: (raw - 16384) / 1000
 SENSOR_ID_11 = 0x11  # ✓ Confirmed: PM10 (µg/m³)
-SENSOR_ID_12 = 0x12  # ✓ Confirmed: TVOC (mg/m³, special encoding)
+SENSOR_ID_12 = 0x12  # ✓ Confirmed: TVOC (mg/m³) - formula: raw × 0.001
 SENSOR_ID_13 = 0x13  # ✓ Confirmed: eCO2 (ppm)
 
 # Sensor definitions
 SENSOR_TYPES = {
     SENSOR_ID_01: {
         "id": SENSOR_ID_01,
-        "name": "Sensor 01",
-        "key": "sensor_01",
-        "icon": "mdi:chemical-weapon",
-        "device_class": None,
-        "unit": None,  # TBD
-        "note": "Possibly Formaldehyde (HCHO)",
+        "name": "Temperature",
+        "key": "temperature",
+        "icon": "mdi:thermometer",
+        "device_class": "temperature",
+        "unit": "°C",
+        "note": "Confirmed: Temperature with offset encoding - formula: (raw - 4000) / 100",
     },
     SENSOR_ID_06: {
         "id": SENSOR_ID_06,
-        "name": "Sensor 06",
-        "key": "sensor_06",
-        "icon": "mdi:air-filter",
-        "device_class": None,
-        "unit": "µg/m³",  # Assuming PM2.5
-        "note": "Possibly PM2.5",
+        "name": "Humidity",
+        "key": "humidity",
+        "icon": "mdi:water-percent",
+        "device_class": "humidity",
+        "unit": "%",
+        "note": "Confirmed: Relative humidity - formula: raw / 100",
     },
     SENSOR_ID_08: {
         "id": SENSOR_ID_08,
@@ -79,12 +79,12 @@ SENSOR_TYPES = {
     },
     SENSOR_ID_0A: {
         "id": SENSOR_ID_0A,
-        "name": "Sensor 0A",
-        "key": "sensor_0a",
-        "icon": "mdi:molecule-co2",
+        "name": "Formaldehyde",
+        "key": "formaldehyde",
+        "icon": "mdi:chemical-weapon",
         "device_class": None,
-        "unit": "ppm",  # Assuming eCO2
-        "note": "Possibly eCO2",
+        "unit": "mg/m³",
+        "note": "Confirmed: Formaldehyde (HCHO) with offset - formula: (raw - 16384) / 1000",
     },
     SENSOR_ID_11: {
         "id": SENSOR_ID_11,

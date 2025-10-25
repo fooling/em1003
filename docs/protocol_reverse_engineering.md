@@ -27,7 +27,15 @@ Value = (Low Byte) + (High Byte × 256)
 Example: 33 00 → 0x33 + (0x00 × 256) = 51 decimal
 ```
 
-**8 Sensor IDs**: `0x01`, `0x06`, `0x08` (Noise), `0x09` (PM2.5), `0x0A`, `0x11` (PM10), `0x12` (TVOC), `0x13` (eCO2)
+**8 Sensor IDs** (ALL CONFIRMED):
+- `0x01` Temperature (°C)
+- `0x06` Humidity (%)
+- `0x08` Noise (dB)
+- `0x09` PM2.5 (µg/m³)
+- `0x0A` Formaldehyde (mg/m³)
+- `0x11` PM10 (µg/m³)
+- `0x12` TVOC (mg/m³)
+- `0x13` eCO2 (ppm)
 
 ---
 
@@ -101,26 +109,35 @@ The device responds via the notify characteristic (`0xFFF4`) with a 5-byte messa
 
 The following sensor IDs have been observed:
 
-| Sensor ID | Sensor Type | Unit | Notes |
-|-----------|------------|------|-------|
-| `0x01` | Unknown | TBD | Not yet identified |
-| `0x06` | Unknown | TBD | Not yet identified |
-| `0x08` | Noise Level | dB | ✓ Confirmed: 31-00 = 49 dB |
-| `0x09` | PM2.5 | µg/m³ | ✓ Confirmed: 1C-00 = 28 µg/m³ |
-| `0x0A` | Unknown | TBD | Not yet identified |
-| `0x11` | PM10 | µg/m³ | ✓ Confirmed |
-| `0x12` | TVOC | mg/m³ | ✓ Confirmed: 01-00 = 0.001 (special encoding) |
-| `0x13` | eCO2 | ppm | ✓ Confirmed: 9B-01 = 411 ppm |
+| Sensor ID | Sensor Type | Unit | Formula | Example |
+|-----------|------------|------|---------|---------|
+| `0x01` | **Temperature** | °C | `(raw - 4000) / 100` | 2C-1A (6700) = 27.00°C |
+| `0x06` | **Humidity** | % | `raw / 100` | DB-11 (4571) = 45.71% |
+| `0x08` | **Noise Level** | dB | `raw` (no conversion) | 31-00 (49) = 49 dB |
+| `0x09` | **PM2.5** | µg/m³ | `raw` (no conversion) | 1C-00 (28) = 28 µg/m³ |
+| `0x0A` | **Formaldehyde** | mg/m³ | `(raw - 16384) / 1000` | 00-40 (16384) = 0.000 mg/m³ |
+| `0x11` | **PM10** | µg/m³ | `raw` (no conversion) | 16-00 (22) = 22 µg/m³ |
+| `0x12` | **TVOC** | mg/m³ | `raw × 0.001` | 01-00 (1) = 0.001 mg/m³ |
+| `0x13` | **eCO2** | ppm | `raw` (no conversion) | 9B-01 (411) = 411 ppm |
 
-**Possible sensor types** (order not yet confirmed):
-- Formaldehyde (HCHO)
-- PM2.5 (Particulate Matter 2.5µm)
-- PM10 (Particulate Matter 10µm)
-- TVOC (Total Volatile Organic Compounds)
-- eCO2 (Equivalent CO2)
-- Noise Level
-- Temperature
-- Humidity
+**All 8 sensor types have been confirmed through testing with real environmental data!**
+
+#### Special Encoding Notes
+
+1. **Temperature (0x01)**: Uses offset of 4000 to support negative temperatures
+   - Range: -40°C to 615.35°C (raw 0 to 65535)
+   - Negative example: -10°C = raw 3900
+
+2. **Humidity (0x06)**: Scaled by 100 for precision
+   - Range: 0% to 655.35% (raw 0 to 65535)
+   - Typical indoor range: 30-70%
+
+3. **Formaldehyde (0x0A)**: Uses offset of 16384 (0x4000)
+   - Baseline value: 16384 = 0.000 mg/m³
+   - Can measure positive and negative deviations from baseline
+
+4. **TVOC (0x12)**: Multiplies raw value by 0.001
+   - Different from other sensors which divide by scale factor
 
 ## Data Parsing
 
@@ -147,39 +164,61 @@ Many embedded systems and IoT devices use Little Endian format because it allows
 
 #### Parsing Examples
 
-**Example 1**: Response `AC 06 08 31 00` (Noise sensor)
+**Example 1**: Temperature - Response `CD 06 01 2C 1A`
+- Sensor ID: `0x01` = Temperature
+- Value bytes: `2C 1A` (Little Endian)
+- **Raw value**: `0x2C + (0x1A × 256) = 44 + 6656` = **6700**
+- **Formula**: `(6700 - 4000) / 100` = **27.00°C**
+- **✓ Confirmed with real measurement: 27.0°C**
+
+**Example 2**: Humidity - Response `CB 06 06 DB 11`
+- Sensor ID: `0x06` = Humidity
+- Value bytes: `DB 11` (Little Endian)
+- **Raw value**: `0xDB + (0x11 × 256) = 219 + 4352` = **4571**
+- **Formula**: `4571 / 100` = **45.71%**
+- **✓ Confirmed with real measurement: 45%**
+
+**Example 3**: Noise - Response `AC 06 08 31 00`
 - Sensor ID: `0x08` = Noise
 - Value bytes: `31 00` (Little Endian)
-- Byte breakdown:
-  - Byte 3 (LSB/Low): `0x31` = 49 decimal
-  - Byte 4 (MSB/High): `0x00` = 0 decimal
-- **Calculation**: `0x31 + (0x00 × 256) = 49 + 0` = **49 dB**
-- **✓ Confirmed real-world value**
+- **Raw value**: `0x31 + (0x00 × 256)` = **49**
+- **Formula**: `raw` (no conversion) = **49 dB**
+- **✓ Confirmed with real measurement: 49 dB**
 
-**Example 2**: Response `AC 06 09 1C 00` (PM2.5 sensor)
+**Example 4**: PM2.5 - Response `AD 06 09 1C 00`
 - Sensor ID: `0x09` = PM2.5
 - Value bytes: `1C 00` (Little Endian)
-- Byte breakdown:
-  - Low byte: `0x1C` = 28 decimal
-  - High byte: `0x00` = 0 decimal
-- **Calculation**: `0x1C + (0x00 × 256) = 28` = **28 µg/m³**
-- **✓ Confirmed real-world value**
+- **Raw value**: `0x1C + (0x00 × 256)` = **28**
+- **Formula**: `raw` (no conversion) = **28 µg/m³**
+- **✓ Confirmed with real measurement: 28 µg/m³**
 
-**Example 3**: Response `AC 06 13 9B 01` (eCO2 sensor)
-- Sensor ID: `0x13` = eCO2
-- Value bytes: `9B 01` (Little Endian)
-- Byte breakdown:
-  - Low byte: `0x9B` = 155 decimal
-  - High byte: `0x01` = 1 decimal
-- **Calculation**: `0x9B + (0x01 × 256) = 155 + 256` = **411 ppm**
-- **✓ Confirmed real-world value**
+**Example 5**: Formaldehyde - Response `CD 06 0A 00 40`
+- Sensor ID: `0x0A` = Formaldehyde
+- Value bytes: `00 40` (Little Endian)
+- **Raw value**: `0x00 + (0x40 × 256) = 0 + 16384` = **16384**
+- **Formula**: `(16384 - 16384) / 1000` = **0.000 mg/m³**
+- **✓ Confirmed with real measurement: 0.00 mg/m³**
 
-**Example 4**: Response `AC 06 12 01 00` (TVOC sensor - special encoding)
+**Example 6**: PM10 - Response `AE 06 11 16 00`
+- Sensor ID: `0x11` = PM10
+- Value bytes: `16 00` (Little Endian)
+- **Raw value**: `0x16 + (0x00 × 256)` = **22**
+- **Formula**: `raw` (no conversion) = **22 µg/m³**
+- **✓ Confirmed**
+
+**Example 7**: TVOC - Response `AF 06 12 01 00`
 - Sensor ID: `0x12` = TVOC
 - Value bytes: `01 00` (Little Endian)
 - **Raw value**: `0x01 + (0x00 × 256)` = **1**
-- **Actual value**: **0.001 mg/m³** (special scaling factor)
-- **✓ Confirmed: This sensor uses a different encoding**
+- **Formula**: `1 × 0.001` = **0.001 mg/m³**
+- **✓ Confirmed with real measurement: 0.001 mg/m³**
+
+**Example 8**: eCO2 - Response `B0 06 13 9B 01`
+- Sensor ID: `0x13` = eCO2
+- Value bytes: `9B 01` (Little Endian)
+- **Raw value**: `0x9B + (0x01 × 256) = 155 + 256` = **411**
+- **Formula**: `raw` (no conversion) = **411 ppm**
+- **✓ Confirmed with real measurement: 411 ppm**
 
 #### Format Summary
 - **Data Type**: 16-bit unsigned integer
@@ -221,7 +260,7 @@ Many embedded systems and IoT devices use Little Endian format because it allows
 
 ## Implementation Status
 
-### Confirmed
+### Confirmed ✅
 - ✅ Device name reading via standard BLE characteristic
 - ✅ Service UUID: `09de2880-1415-4e2c-a48a-3938e3288537`
 - ✅ Write characteristic: `0xFFF1`
@@ -230,19 +269,20 @@ Many embedded systems and IoT devices use Little Endian format because it allows
 - ✅ Response format: `[seq][06][sensor_id][value_bytes]`
 - ✅ Sequence ID matching works
 - ✅ Value format: 2 bytes, **Little Endian**, unsigned 16-bit integer
-- ✅ **Sensor ID mappings (confirmed)**:
-  - `0x08` = Noise Level (dB)
-  - `0x09` = PM2.5 (µg/m³)
-  - `0x11` = PM10 (µg/m³)
-  - `0x12` = TVOC (mg/m³, special encoding)
-  - `0x13` = eCO2 (ppm)
+- ✅ **ALL 8 Sensor ID mappings confirmed**:
+  - `0x01` = Temperature (°C) - formula: `(raw - 4000) / 100`
+  - `0x06` = Humidity (%) - formula: `raw / 100`
+  - `0x08` = Noise Level (dB) - formula: `raw`
+  - `0x09` = PM2.5 (µg/m³) - formula: `raw`
+  - `0x0A` = Formaldehyde (mg/m³) - formula: `(raw - 16384) / 1000`
+  - `0x11` = PM10 (µg/m³) - formula: `raw`
+  - `0x12` = TVOC (mg/m³) - formula: `raw × 0.001`
+  - `0x13` = eCO2 (ppm) - formula: `raw`
 
 ### To Be Determined
-- ❓ Sensor IDs `0x01`, `0x06`, `0x0A` - not yet identified
-- ❓ Scaling factor for TVOC (0x12) - appears to use special encoding
-- ❓ Whether all sensors use 2-byte values or if some use different lengths
 - ❓ Other command types besides `0x06`
 - ❓ Error handling and timeout behavior
+- ❓ Battery level reading (if supported)
 
 ## Example Communication Session
 

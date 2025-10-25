@@ -118,11 +118,22 @@ class EM1003Device:
                 raw_value = int.from_bytes(value_bytes[:2], byteorder='little')
                 _LOGGER.info("Sensor %02x raw value: %d (0x%s)", sensor_id, raw_value, value_bytes[:2].hex())
 
-                # Apply special scaling for TVOC sensor (0x12)
-                if sensor_id == 0x12:
-                    # TVOC uses special encoding: raw value × 0.001
+                # Apply sensor-specific scaling and offsets
+                if sensor_id == 0x01:
+                    # Temperature: (raw - 4000) / 100
+                    # Offset allows negative temperatures (e.g., -40°C = raw 0)
+                    self.sensor_data[sensor_id] = (raw_value - 4000) / 100.0
+                elif sensor_id == 0x06:
+                    # Humidity: raw / 100
+                    self.sensor_data[sensor_id] = raw_value / 100.0
+                elif sensor_id == 0x0A:
+                    # Formaldehyde: (raw - 16384) / 1000
+                    self.sensor_data[sensor_id] = (raw_value - 16384) / 1000.0
+                elif sensor_id == 0x12:
+                    # TVOC: raw × 0.001
                     self.sensor_data[sensor_id] = raw_value * 0.001
                 else:
+                    # Other sensors use raw value directly
                     self.sensor_data[sensor_id] = raw_value
 
             # Set the future result if waiting
