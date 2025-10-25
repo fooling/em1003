@@ -78,19 +78,58 @@ class EM1003DataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER,
             name=f"EM1003 {mac_address}",
             update_interval=SCAN_INTERVAL,
+
+            # Always request a full refresh to ensure we get fresh data
+            always_update=True,
         )
         self.em1003_device = em1003_device
         self.mac_address = mac_address
+        self._consecutive_failures = 0
 
     async def _async_update_data(self) -> dict:
-        """Fetch data from the device."""
+        """Fetch data from the device with automatic retry on failure."""
         try:
-            _LOGGER.debug("Updating sensor data for %s", self.mac_address)
+            _LOGGER.debug("Updating sensor data for %s (failures: %d)",
+                         self.mac_address, self._consecutive_failures)
+
             data = await self.em1003_device.read_all_sensors()
-            _LOGGER.debug("Sensor data updated: %s", data)
+
+            # Check if we got any valid data
+            valid_data_count = sum(1 for v in data.values() if v is not None)
+
+            if valid_data_count == 0:
+                # No sensors returned data - treat as failure
+                self._consecutive_failures += 1
+                _LOGGER.warning(
+                    "No sensor data received from %s (failure #%d)",
+                    self.mac_address, self._consecutive_failures
+                )
+                raise UpdateFailed(f"No sensor data received from {self.mac_address}")
+
+            # Success! Reset failure counter
+            if self._consecutive_failures > 0:
+                _LOGGER.info(
+                    "Successfully reconnected to %s after %d failures",
+                    self.mac_address, self._consecutive_failures
+                )
+            self._consecutive_failures = 0
+
+            _LOGGER.debug(
+                "Sensor data updated for %s: %d/%d sensors responded",
+                self.mac_address, valid_data_count, len(data)
+            )
             return data
+
         except Exception as err:
-            raise UpdateFailed(f"Error communicating with device: {err}") from err
+            self._consecutive_failures += 1
+            _LOGGER.error(
+                "Error communicating with %s (failure #%d): %s",
+                self.mac_address, self._consecutive_failures, err
+            )
+            # UpdateFailed will trigger coordinator's built-in retry mechanism
+            raise UpdateFailed(
+                f"Error communicating with device {self.mac_address}: {err}"
+            ) from err
 
 
 class EM1003Sensor(CoordinatorEntity, SensorEntity):

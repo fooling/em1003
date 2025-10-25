@@ -4,8 +4,9 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from bleak import BleakClient, BleakScanner
+from bleak import BleakClient
 from bleak.exc import BleakError
+from bleak_retry_connector import establish_connection
 
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
@@ -58,7 +59,19 @@ async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str |
             _LOGGER.warning("Device not found when reading name: %s", mac_address)
             return None
 
-        async with BleakClient(device, timeout=DEVICE_TIMEOUT) as client:
+        # Use bleak-retry-connector for reliable connection
+        client = await establish_connection(
+            BleakClient,
+            device,
+            mac_address,
+            disconnected_callback=lambda _: None,
+            use_services_cache=True,
+            ble_device_callback=lambda: bluetooth.async_ble_device_from_address(
+                hass, mac_address, connectable=True
+            ),
+        )
+
+        try:
             _LOGGER.debug("Connected to device %s to read name", mac_address)
 
             # Read the Device Name characteristic (0x2A00)
@@ -68,6 +81,9 @@ async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str |
             _LOGGER.info("Read device name from %s: %s", mac_address, device_name)
             return device_name
 
+
+        finally:
+            await client.disconnect()
     except BleakError as err:
         _LOGGER.error("Bleak error reading device name from %s: %s", mac_address, err)
         return None
@@ -161,7 +177,20 @@ class EM1003Device:
                 _LOGGER.error("Device not found: %s", self.mac_address)
                 return None
 
-            async with BleakClient(device, timeout=DEVICE_TIMEOUT) as client:
+
+            # Use bleak-retry-connector for reliable connection
+            client = await establish_connection(
+                BleakClient,
+                device,
+                self.mac_address,
+                disconnected_callback=lambda _: None,
+                use_services_cache=True,
+                ble_device_callback=lambda: bluetooth.async_ble_device_from_address(
+                    self.hass, self.mac_address, connectable=True
+                ),
+            )
+
+            try:
                 _LOGGER.debug("Connected to device %s", self.mac_address)
 
                 # Subscribe to notifications
@@ -196,6 +225,9 @@ class EM1003Device:
                 # Return parsed value
                 return self.sensor_data.get(sensor_id)
 
+            finally:
+                await client.disconnect()
+
         except BleakError as err:
             _LOGGER.error("Bleak error reading sensor %02x: %s", sensor_id, err)
             return None
@@ -204,18 +236,87 @@ class EM1003Device:
             return None
 
     async def read_all_sensors(self) -> dict[int, float | None]:
-        """Read all sensors and return their values.
+
+        """Read all sensors in a single connection session.
 
         Returns:
             Dictionary mapping sensor IDs to their values
         """
         results = {}
 
-        for sensor_id in SENSOR_TYPES.keys():
-            value = await self.read_sensor(sensor_id)
-            results[sensor_id] = value
-            # Small delay between reads
-            await asyncio.sleep(0.5)
+        try:
+            device = bluetooth.async_ble_device_from_address(
+                self.hass, self.mac_address, connectable=True
+            )
+
+            if not device:
+                _LOGGER.error("Device not found: %s", self.mac_address)
+                return results
+
+            # Use bleak-retry-connector for reliable connection
+            _LOGGER.debug("Establishing connection to %s for reading all sensors", self.mac_address)
+            client = await establish_connection(
+                BleakClient,
+                device,
+                self.mac_address,
+                disconnected_callback=lambda _: _LOGGER.debug("Device %s disconnected", self.mac_address),
+                use_services_cache=True,
+                ble_device_callback=lambda: bluetooth.async_ble_device_from_address(
+                    self.hass, self.mac_address, connectable=True
+                ),
+            )
+
+            try:
+                _LOGGER.info("Connected to device %s, reading all sensors", self.mac_address)
+
+                # Subscribe to notifications once for all sensor reads
+                await client.start_notify(EM1003_NOTIFY_CHAR_UUID, self._notification_handler)
+                _LOGGER.debug("Subscribed to notifications")
+
+                # Read all sensors in one connection session
+                for sensor_id in SENSOR_TYPES.keys():
+                    try:
+                        # Prepare request
+                        seq_id = self._get_next_sequence_id()
+                        request = bytes([seq_id, CMD_READ_SENSOR, sensor_id])
+
+                        _LOGGER.debug("Reading sensor %02x: %s", sensor_id, request.hex())
+
+                        # Create future for response
+                        self._notify_future = asyncio.Future()
+
+                        # Send request
+                        await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
+
+                        # Wait for response with timeout
+                        try:
+                            await asyncio.wait_for(self._notify_future, timeout=3.0)
+                            results[sensor_id] = self.sensor_data.get(sensor_id)
+                            _LOGGER.debug("Sensor %02x value: %s", sensor_id, results[sensor_id])
+                        except asyncio.TimeoutError:
+                            _LOGGER.warning("Timeout reading sensor %02x", sensor_id)
+                            results[sensor_id] = None
+
+                        # Small delay between sensor reads
+                        await asyncio.sleep(0.3)
+
+                    except Exception as sensor_err:
+                        _LOGGER.warning("Error reading sensor %02x: %s", sensor_id, sensor_err)
+                        results[sensor_id] = None
+
+                # Stop notifications
+                await client.stop_notify(EM1003_NOTIFY_CHAR_UUID)
+                _LOGGER.info("Completed reading all sensors from %s", self.mac_address)
+
+            finally:
+                await client.disconnect()
+                _LOGGER.debug("Disconnected from %s", self.mac_address)
+
+        except BleakError as err:
+            _LOGGER.error("Bleak error reading all sensors: %s", err)
+        except Exception as err:
+            _LOGGER.error("Error reading all sensors: %s", err, exc_info=True)
+
 
         return results
 
