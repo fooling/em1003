@@ -78,3 +78,15 @@ write_characteristic:
       example: "0102ff"
       selector:
         text:
+
+read_device_name:
+  name: Read Device Name
+  description: Read the device name from the BLE device using the Device Name characteristic (UUID 0x2A00)
+  fields:
+    mac_address:
+      name: MAC Address
+      description: The MAC address of the BLE device
+      required: true
+      example: "AA:BB:CC:DD:EE:FF"
+      selector:
+        text:

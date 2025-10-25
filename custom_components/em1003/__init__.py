@@ -22,16 +22,53 @@ from .const import (
     SERVICE_WRITE_CHARACTERISTIC,
     SERVICE_LIST_SERVICES,
     SERVICE_DISCOVER_ALL,
+    SERVICE_READ_DEVICE_NAME,
     ATTR_MAC_ADDRESS,
     ATTR_SERVICE_UUID,
     ATTR_CHARACTERISTIC_UUID,
     ATTR_DATA,
     DEVICE_TIMEOUT,
+    DEVICE_NAME_UUID,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = []
+
+
+async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str | None:
+    """Read device name from BLE device using Device Name characteristic.
+
+    Args:
+        hass: Home Assistant instance
+        mac_address: MAC address of the BLE device
+
+    Returns:
+        Device name as string, or None if reading fails
+    """
+    try:
+        device = bluetooth.async_ble_device_from_address(hass, mac_address, connectable=True)
+
+        if not device:
+            _LOGGER.warning("Device not found when reading name: %s", mac_address)
+            return None
+
+        async with BleakClient(device, timeout=DEVICE_TIMEOUT) as client:
+            _LOGGER.debug("Connected to device %s to read name", mac_address)
+
+            # Read the Device Name characteristic (0x2A00)
+            value = await client.read_gatt_char(DEVICE_NAME_UUID)
+            device_name = value.decode('utf-8').strip()
+
+            _LOGGER.info("Read device name from %s: %s", mac_address, device_name)
+            return device_name
+
+    except BleakError as err:
+        _LOGGER.error("Bleak error reading device name from %s: %s", mac_address, err)
+        return None
+    except Exception as err:
+        _LOGGER.error("Error reading device name from %s: %s", mac_address, err)
+        return None
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -269,6 +306,21 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         _LOGGER.info("=== Write complete ===")
 
+    async def handle_read_device_name(call: ServiceCall) -> None:
+        """Handle the read_device_name service call."""
+        mac_address = call.data.get(ATTR_MAC_ADDRESS)
+
+        _LOGGER.info("=== Reading device name from: %s ===", mac_address)
+
+        device_name = await async_read_device_name(hass, mac_address)
+
+        if device_name:
+            _LOGGER.info("✓ Device name: %s", device_name)
+        else:
+            _LOGGER.warning("✗ Failed to read device name")
+
+        _LOGGER.info("=== Read device name complete ===")
+
     # Register services
     hass.services.async_register(
         DOMAIN,
@@ -315,6 +367,15 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             vol.Required(ATTR_MAC_ADDRESS): str,
             vol.Required(ATTR_CHARACTERISTIC_UUID): str,
             vol.Required(ATTR_DATA): vol.Any(str, list),
+        }),
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_READ_DEVICE_NAME,
+        handle_read_device_name,
+        schema=vol.Schema({
+            vol.Required(ATTR_MAC_ADDRESS): str,
         }),
     )
 
