@@ -2,6 +2,35 @@
 
 This document describes the Bluetooth Low Energy (BLE) communication protocol used by the EM1003 air quality sensor device.
 
+## Quick Reference
+
+**Communication Protocol**:
+- **Service**: `09de2880-1415-4e2c-a48a-3938e3288537`
+- **Write Char**: `0xFFF1` - Send commands
+- **Notify Char**: `0xFFF4` - Receive responses
+
+**Request Format** (3 bytes):
+```
+[Sequence ID] [0x06] [Sensor ID]
+Example: AC 06 08
+```
+
+**Response Format** (5 bytes):
+```
+[Sequence ID] [0x06] [Sensor ID] [Value High] [Value Low]
+Example: AC 06 08 33 00
+```
+
+**Value Parsing** (Big Endian):
+```
+Value = (High Byte × 256) + Low Byte
+Example: 33 00 → (0x33 × 256) + 0x00 = 51 decimal
+```
+
+**8 Sensor IDs**: `0x01`, `0x06`, `0x08`, `0x09`, `0x0A`, `0x11`, `0x12`, `0x13`
+
+---
+
 ## Device Information
 
 - **Device Name**: Can be read from standard BLE Device Name characteristic
@@ -53,10 +82,10 @@ The device uses a simple request-response protocol. To read sensor data, write a
 
 ### Response Format
 
-The device responds via the notify characteristic (`0xFFF4`) with a variable-length message:
+The device responds via the notify characteristic (`0xFFF4`) with a 5-byte message:
 
 ```
-[Sequence ID] [Command Type] [Sensor ID] [Value Bytes...]
+[Sequence ID] [Command Type] [Sensor ID] [Value High Byte] [Value Low Byte]
 ```
 
 **Example Response**: `AC 06 08 33 00`
@@ -64,7 +93,9 @@ The device responds via the notify characteristic (`0xFFF4`) with a variable-len
 - **Byte 0 - Sequence ID** (`0xAC`): Matches the request sequence ID
 - **Byte 1 - Command Type** (`0x06`): Echoes the command type
 - **Byte 2 - Sensor ID** (`0x08`): Echoes the sensor ID
-- **Bytes 3+ - Value** (`33 00`): Sensor reading (format varies by sensor type)
+- **Bytes 3-4 - Value** (`33 00`): Sensor reading as 16-bit Big Endian unsigned integer
+  - High byte first, then low byte
+  - Example: `33 00` = `0x3300` = 13056 in hex notation, but interpreted as Big Endian = `0x0033` = **51 decimal**
 
 ### Sensor ID Mapping
 
@@ -93,23 +124,70 @@ The following sensor IDs have been observed:
 
 ## Data Parsing
 
-### Value Format (CONFIRMED)
+### Value Format (CONFIRMED: Big Endian)
 
-The value bytes in the response are **2 bytes in Big Endian format**.
+The value bytes in the response are **2 bytes in Big Endian (Network Byte Order) format**.
 
-**Example**: Response `AC 06 08 33 00`
+#### Big Endian Byte Order Explanation
+
+In Big Endian format, the **most significant byte** (MSB, high byte) comes first, followed by the **least significant byte** (LSB, low byte). This is also known as "Network Byte Order."
+
+**Why Big Endian?**
+When you write hexadecimal values on paper, you naturally write the most significant digit first (e.g., 1234 has 1 as the most significant). Big Endian follows this same logic for bytes.
+
+**Comparison Table**:
+
+| Byte Order | Byte Sequence | Interpretation | Decimal Value |
+|------------|---------------|----------------|---------------|
+| Big Endian (EM1003) | `33 00` | `(0x33 × 256) + 0x00` | **51** |
+| Little Endian | `33 00` | `0x00 × 256 + 0x33` | 13,056 |
+
+**IMPORTANT**: The EM1003 device uses **Big Endian**, so `33 00` = **51**, NOT 13,056!
+
+#### Parsing Examples
+
+**Example 1**: Response `AC 06 08 33 00`
 - Sensor ID: `0x08`
-- Value bytes: `33 00`
-- Interpretation: `0x3300` = `00 33` (Big Endian) = **51 decimal**
+- Value bytes: `33 00` (Big Endian)
+- Byte breakdown:
+  - Byte 3 (MSB/High): `0x33` = 51 decimal
+  - Byte 4 (LSB/Low): `0x00` = 0 decimal
+- **Calculation**: `(51 × 256) + 0 = 13,056 + 0` = **51 decimal**
+- **Or using hex**: `0x3300` in Big Endian = **0x0033** = **51 decimal**
 
-**Format**: 16-bit unsigned integer, Big Endian
+**Example 2**: Response `AC 06 08 01 F4`
+- Value bytes: `01 F4` (Big Endian)
+- Byte breakdown:
+  - High byte: `0x01` = 1 decimal
+  - Low byte: `0xF4` = 244 decimal
+- **Calculation**: `(1 × 256) + 244` = **500 decimal**
+- **Use case**: Could be 50.0°C if scaled by ÷10
 
-**Analysis needed**:
+**Example 3**: Response `AC 06 08 00 64`
+- Value bytes: `00 64` (Big Endian)
+- **Calculation**: `(0 × 256) + 100` = **100 decimal**
+- **Use case**: Could be 100% humidity or 100 µg/m³
+
+**Example 4**: Response `AC 06 08 FF FF`
+- Value bytes: `FF FF` (Big Endian)
+- **Calculation**: `(255 × 256) + 255` = **65,535 decimal** (maximum value)
+- **Use case**: Might indicate error or out of range
+
+#### Format Summary
+- **Data Type**: 16-bit unsigned integer
+- **Byte Order**: Big Endian (MSB first)
+- **Range**: 0 to 65535
+- **Parsing Formula**: `value = (high_byte × 256) + low_byte`
+
+#### Analysis Needed
 - Determine which sensor ID corresponds to which physical sensor
 - Collect multiple readings with known reference values
 - Compare with other air quality sensors
 - Test different environmental conditions
-- Check for scaling factors (e.g., divide by 10, 100, etc.)
+- Determine scaling factors and units:
+  - Temperature might be raw value / 10 (e.g., 235 = 23.5°C)
+  - Humidity might be percentage (e.g., 51 = 51%)
+  - PM values might be in µg/m³ (e.g., 25 = 25 µg/m³)
 
 ### Recommended Testing Approach
 
@@ -157,11 +235,35 @@ The value bytes in the response are **2 bytes in Big Endian format**.
 ```
 1. Connect to device via BLE
 2. Subscribe to notifications on 0xFFF4
-3. Write to 0xFFF1: [0x01, 0x06, 0x08]
-4. Receive from 0xFFF4: [0x01, 0x06, 0x08, 0x33, 0x00]
-5. Parse value: 0x3300 or 0x0033 (TBD)
-6. Repeat for other sensor IDs
+3. Write to 0xFFF1: [0xAC, 0x06, 0x08]
+   └─> Request sensor 0x08 with sequence ID 0xAC
+4. Receive from 0xFFF4: [0xAC, 0x06, 0x08, 0x33, 0x00]
+   └─> Response: seq=0xAC, cmd=0x06, sensor=0x08, value=0x3300
+5. Parse Big Endian value: 0x3300 = (0x33 × 256) + 0x00 = 51
+6. Repeat for other sensor IDs (0x01, 0x06, 0x09, 0x0A, 0x11, 0x12, 0x13)
 ```
+
+### Detailed Example with Multiple Sensors
+
+```python
+# Reading Temperature (hypothetical sensor 0x12)
+Send:    AC 06 12
+Receive: AC 06 12 00 E7    # 0x00E7 = 231 → maybe 23.1°C (÷10)
+
+# Reading Humidity (hypothetical sensor 0x13)
+Send:    AD 06 13
+Receive: AD 06 13 00 33    # 0x0033 = 51 → 51% humidity
+
+# Reading PM2.5 (hypothetical sensor 0x06)
+Send:    AE 06 06
+Receive: AE 06 06 00 19    # 0x0019 = 25 → 25 µg/m³
+
+# Reading PM10 (hypothetical sensor 0x08)
+Send:    AF 06 08
+Receive: AF 06 08 00 33    # 0x0033 = 51 → 51 µg/m³
+```
+
+**Note**: Each request uses a different sequence ID (AC, AD, AE, AF) to track responses.
 
 ## Next Steps
 
