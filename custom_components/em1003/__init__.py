@@ -22,16 +22,202 @@ from .const import (
     SERVICE_WRITE_CHARACTERISTIC,
     SERVICE_LIST_SERVICES,
     SERVICE_DISCOVER_ALL,
+    SERVICE_READ_DEVICE_NAME,
     ATTR_MAC_ADDRESS,
     ATTR_SERVICE_UUID,
     ATTR_CHARACTERISTIC_UUID,
     ATTR_DATA,
     DEVICE_TIMEOUT,
+    DEVICE_NAME_UUID,
+    EM1003_SERVICE_UUID,
+    EM1003_WRITE_CHAR_UUID,
+    EM1003_NOTIFY_CHAR_UUID,
+    CMD_READ_SENSOR,
+    SENSOR_TYPES,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = []
+PLATFORMS: list[Platform] = [Platform.SENSOR]
+
+
+async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str | None:
+    """Read device name from BLE device using Device Name characteristic.
+
+    Args:
+        hass: Home Assistant instance
+        mac_address: MAC address of the BLE device
+
+    Returns:
+        Device name as string, or None if reading fails
+    """
+    try:
+        device = bluetooth.async_ble_device_from_address(hass, mac_address, connectable=True)
+
+        if not device:
+            _LOGGER.warning("Device not found when reading name: %s", mac_address)
+            return None
+
+        async with BleakClient(device, timeout=DEVICE_TIMEOUT) as client:
+            _LOGGER.debug("Connected to device %s to read name", mac_address)
+
+            # Read the Device Name characteristic (0x2A00)
+            value = await client.read_gatt_char(DEVICE_NAME_UUID)
+            device_name = value.decode('utf-8').strip()
+
+            _LOGGER.info("Read device name from %s: %s", mac_address, device_name)
+            return device_name
+
+    except BleakError as err:
+        _LOGGER.error("Bleak error reading device name from %s: %s", mac_address, err)
+        return None
+    except Exception as err:
+        _LOGGER.error("Error reading device name from %s: %s", mac_address, err)
+        return None
+
+
+class EM1003Device:
+    """Representation of an EM1003 BLE device."""
+
+    def __init__(self, hass: HomeAssistant, mac_address: str) -> None:
+        """Initialize the device."""
+        self.hass = hass
+        self.mac_address = mac_address
+        self._client: BleakClient | None = None
+        self._notify_future: asyncio.Future | None = None
+        self._sequence_id = 0xA0  # Start sequence ID
+        self.sensor_data: dict[int, float | None] = {}
+
+    def _get_next_sequence_id(self) -> int:
+        """Get next sequence ID for requests."""
+        self._sequence_id = (self._sequence_id + 1) % 0x100
+        return self._sequence_id
+
+    def _notification_handler(self, sender, data: bytearray) -> None:
+        """Handle notification from device."""
+        try:
+            _LOGGER.debug("Received notification from %s: %s", self.mac_address, data.hex())
+
+            if len(data) < 3:
+                _LOGGER.warning("Notification too short: %d bytes", len(data))
+                return
+
+            seq_id = data[0]
+            cmd_type = data[1]
+            sensor_id = data[2]
+            value_bytes = data[3:]
+
+            _LOGGER.info(
+                "Parsed notification: seq=%02x, cmd=%02x, sensor=%02x, value=%s",
+                seq_id, cmd_type, sensor_id, value_bytes.hex()
+            )
+
+            # Parse value based on sensor type
+            # Value is in little-endian format (e.g., 0x31 0x00 = 49)
+            if len(value_bytes) >= 2:
+                raw_value = int.from_bytes(value_bytes[:2], byteorder='little')
+                _LOGGER.info("Sensor %02x raw value: %d (0x%s)", sensor_id, raw_value, value_bytes[:2].hex())
+
+                # Apply sensor-specific scaling and offsets
+                if sensor_id == 0x01:
+                    # Temperature: (raw - 4000) / 100
+                    # Offset allows negative temperatures (e.g., -40°C = raw 0)
+                    self.sensor_data[sensor_id] = (raw_value - 4000) / 100.0
+                elif sensor_id == 0x06:
+                    # Humidity: raw / 100
+                    self.sensor_data[sensor_id] = raw_value / 100.0
+                elif sensor_id == 0x0A:
+                    # Formaldehyde: (raw - 16384) / 1000
+                    self.sensor_data[sensor_id] = (raw_value - 16384) / 1000.0
+                elif sensor_id == 0x12:
+                    # TVOC: raw × 0.001
+                    self.sensor_data[sensor_id] = raw_value * 0.001
+                else:
+                    # Other sensors use raw value directly
+                    self.sensor_data[sensor_id] = raw_value
+
+            # Set the future result if waiting
+            if self._notify_future and not self._notify_future.done():
+                self._notify_future.set_result(data)
+
+        except Exception as err:
+            _LOGGER.error("Error handling notification: %s", err, exc_info=True)
+
+    async def read_sensor(self, sensor_id: int) -> float | None:
+        """Read a specific sensor value.
+
+        Args:
+            sensor_id: Sensor ID to read
+
+        Returns:
+            Sensor value or None if reading fails
+        """
+        try:
+            device = bluetooth.async_ble_device_from_address(
+                self.hass, self.mac_address, connectable=True
+            )
+
+            if not device:
+                _LOGGER.error("Device not found: %s", self.mac_address)
+                return None
+
+            async with BleakClient(device, timeout=DEVICE_TIMEOUT) as client:
+                _LOGGER.debug("Connected to device %s", self.mac_address)
+
+                # Subscribe to notifications
+                await client.start_notify(EM1003_NOTIFY_CHAR_UUID, self._notification_handler)
+                _LOGGER.debug("Subscribed to notifications")
+
+                # Prepare request
+                seq_id = self._get_next_sequence_id()
+                request = bytes([seq_id, CMD_READ_SENSOR, sensor_id])
+
+                _LOGGER.info(
+                    "Sending request to sensor %02x: %s",
+                    sensor_id, request.hex()
+                )
+
+                # Create future for response
+                self._notify_future = asyncio.Future()
+
+                # Send request
+                await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
+
+                # Wait for response with timeout
+                try:
+                    await asyncio.wait_for(self._notify_future, timeout=5.0)
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("Timeout waiting for sensor %02x response", sensor_id)
+                    return None
+
+                # Stop notifications
+                await client.stop_notify(EM1003_NOTIFY_CHAR_UUID)
+
+                # Return parsed value
+                return self.sensor_data.get(sensor_id)
+
+        except BleakError as err:
+            _LOGGER.error("Bleak error reading sensor %02x: %s", sensor_id, err)
+            return None
+        except Exception as err:
+            _LOGGER.error("Error reading sensor %02x: %s", sensor_id, err, exc_info=True)
+            return None
+
+    async def read_all_sensors(self) -> dict[int, float | None]:
+        """Read all sensors and return their values.
+
+        Returns:
+            Dictionary mapping sensor IDs to their values
+        """
+        results = {}
+
+        for sensor_id in SENSOR_TYPES.keys():
+            value = await self.read_sensor(sensor_id)
+            results[sensor_id] = value
+            # Small delay between reads
+            await asyncio.sleep(0.5)
+
+        return results
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -40,11 +226,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     _LOGGER.info("Setting up EM1003 device with MAC: %s", mac_address)
 
+    # Try to read device name from BLE device
+    device_name = await async_read_device_name(hass, mac_address)
+
+    if device_name:
+        _LOGGER.info("Successfully read device name: %s", device_name)
+    else:
+        _LOGGER.warning("Could not read device name, using default: %s", entry.title)
+        device_name = entry.title
+
+    # Create EM1003 device instance
+    em1003_device = EM1003Device(hass, mac_address)
+
     # Store device info in hass.data
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {
         CONF_MAC_ADDRESS: mac_address,
         "name": entry.title,
+        "device_name": device_name,
+        "device": em1003_device,
     }
 
     # Register services
@@ -269,6 +469,21 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         _LOGGER.info("=== Write complete ===")
 
+    async def handle_read_device_name(call: ServiceCall) -> None:
+        """Handle the read_device_name service call."""
+        mac_address = call.data.get(ATTR_MAC_ADDRESS)
+
+        _LOGGER.info("=== Reading device name from: %s ===", mac_address)
+
+        device_name = await async_read_device_name(hass, mac_address)
+
+        if device_name:
+            _LOGGER.info("✓ Device name: %s", device_name)
+        else:
+            _LOGGER.warning("✗ Failed to read device name")
+
+        _LOGGER.info("=== Read device name complete ===")
+
     # Register services
     hass.services.async_register(
         DOMAIN,
@@ -315,6 +530,15 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             vol.Required(ATTR_MAC_ADDRESS): str,
             vol.Required(ATTR_CHARACTERISTIC_UUID): str,
             vol.Required(ATTR_DATA): vol.Any(str, list),
+        }),
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_READ_DEVICE_NAME,
+        handle_read_device_name,
+        schema=vol.Schema({
+            vol.Required(ATTR_MAC_ADDRESS): str,
         }),
     )
 

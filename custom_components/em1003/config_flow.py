@@ -19,6 +19,15 @@ from .const import DOMAIN, CONF_MAC_ADDRESS, DEFAULT_NAME
 _LOGGER = logging.getLogger(__name__)
 
 
+async def async_read_device_name_for_config(hass, mac_address: str) -> str | None:
+    """Read device name from BLE device for configuration.
+
+    Import here to avoid circular dependency.
+    """
+    from . import async_read_device_name
+    return await async_read_device_name(hass, mac_address)
+
+
 class EM1003ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for EM1003 BLE Sensor."""
 
@@ -69,8 +78,19 @@ class EM1003ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             await self.async_set_unique_id(mac_address)
             self._abort_if_unique_id_configured()
 
+            # Try to read device name from the BLE device
+            _LOGGER.info("Attempting to read device name from %s", mac_address)
+            device_name = await async_read_device_name_for_config(self.hass, mac_address)
+
+            if device_name:
+                _LOGGER.info("Successfully read device name: %s", device_name)
+                title = f"{device_name} ({mac_address[-8:]})"
+            else:
+                _LOGGER.warning("Could not read device name, using default")
+                title = f"{DEFAULT_NAME} ({mac_address})"
+
             return self.async_create_entry(
-                title=f"{DEFAULT_NAME} ({mac_address})",
+                title=title,
                 data={CONF_MAC_ADDRESS: mac_address},
             )
 
