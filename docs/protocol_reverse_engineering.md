@@ -21,13 +21,13 @@ Example: AC 06 08
 Example: AC 06 08 33 00
 ```
 
-**Value Parsing** (Big Endian):
+**Value Parsing** (Little Endian):
 ```
-Value = (High Byte × 256) + Low Byte
-Example: 33 00 → (0x33 × 256) + 0x00 = 51 decimal
+Value = (Low Byte) + (High Byte × 256)
+Example: 33 00 → 0x33 + (0x00 × 256) = 51 decimal
 ```
 
-**8 Sensor IDs**: `0x01`, `0x06`, `0x08`, `0x09`, `0x0A`, `0x11`, `0x12`, `0x13`
+**8 Sensor IDs**: `0x01`, `0x06`, `0x08` (Noise), `0x09` (PM2.5), `0x0A`, `0x11` (PM10), `0x12` (TVOC), `0x13` (eCO2)
 
 ---
 
@@ -101,16 +101,16 @@ The device responds via the notify characteristic (`0xFFF4`) with a 5-byte messa
 
 The following sensor IDs have been observed:
 
-| Sensor ID | Likely Sensor Type | Notes |
-|-----------|-------------------|-------|
-| `0x01` | Unknown | Possibly Formaldehyde (HCHO) |
-| `0x06` | Unknown | Possibly PM2.5 |
-| `0x08` | Unknown | Possibly PM10 |
-| `0x09` | Unknown | Possibly TVOC |
-| `0x0A` | Unknown | Possibly eCO2 |
-| `0x11` | Unknown | Possibly Noise |
-| `0x12` | Unknown | Possibly Temperature |
-| `0x13` | Unknown | Possibly Humidity |
+| Sensor ID | Sensor Type | Unit | Notes |
+|-----------|------------|------|-------|
+| `0x01` | Unknown | TBD | Not yet identified |
+| `0x06` | Unknown | TBD | Not yet identified |
+| `0x08` | Noise Level | dB | ✓ Confirmed: 31-00 = 49 dB |
+| `0x09` | PM2.5 | µg/m³ | ✓ Confirmed: 1C-00 = 28 µg/m³ |
+| `0x0A` | Unknown | TBD | Not yet identified |
+| `0x11` | PM10 | µg/m³ | ✓ Confirmed |
+| `0x12` | TVOC | mg/m³ | ✓ Confirmed: 01-00 = 0.001 (special encoding) |
+| `0x13` | eCO2 | ppm | ✓ Confirmed: 9B-01 = 411 ppm |
 
 **Possible sensor types** (order not yet confirmed):
 - Formaldehyde (HCHO)
@@ -124,60 +124,69 @@ The following sensor IDs have been observed:
 
 ## Data Parsing
 
-### Value Format (CONFIRMED: Big Endian)
+### Value Format (CONFIRMED: Little Endian)
 
-The value bytes in the response are **2 bytes in Big Endian (Network Byte Order) format**.
+The value bytes in the response are **2 bytes in Little Endian format**.
 
-#### Big Endian Byte Order Explanation
+#### Little Endian Byte Order Explanation
 
-In Big Endian format, the **most significant byte** (MSB, high byte) comes first, followed by the **least significant byte** (LSB, low byte). This is also known as "Network Byte Order."
+In Little Endian format, the **least significant byte** (LSB, low byte) comes first, followed by the **most significant byte** (MSB, high byte). This is the common format used in Intel x86 processors.
 
-**Why Big Endian?**
-When you write hexadecimal values on paper, you naturally write the most significant digit first (e.g., 1234 has 1 as the most significant). Big Endian follows this same logic for bytes.
+**Why Little Endian?**
+Many embedded systems and IoT devices use Little Endian format because it allows for easy byte-by-byte reading and incremental value building.
 
 **Comparison Table**:
 
 | Byte Order | Byte Sequence | Interpretation | Decimal Value |
 |------------|---------------|----------------|---------------|
-| Big Endian (EM1003) | `33 00` | `(0x33 × 256) + 0x00` | **51** |
-| Little Endian | `33 00` | `0x00 × 256 + 0x33` | 13,056 |
+| Little Endian (EM1003) | `33 00` | `0x33 + (0x00 × 256)` | **51** |
+| Little Endian (EM1003) | `9B 01` | `0x9B + (0x01 × 256)` | **411** |
+| Big Endian | `33 00` | `(0x33 × 256) + 0x00` | 13,056 |
 
-**IMPORTANT**: The EM1003 device uses **Big Endian**, so `33 00` = **51**, NOT 13,056!
+**IMPORTANT**: The EM1003 device uses **Little Endian**, so `33 00` = **51**, and `9B 01` = **411**!
 
 #### Parsing Examples
 
-**Example 1**: Response `AC 06 08 33 00`
-- Sensor ID: `0x08`
-- Value bytes: `33 00` (Big Endian)
+**Example 1**: Response `AC 06 08 31 00` (Noise sensor)
+- Sensor ID: `0x08` = Noise
+- Value bytes: `31 00` (Little Endian)
 - Byte breakdown:
-  - Byte 3 (MSB/High): `0x33` = 51 decimal
-  - Byte 4 (LSB/Low): `0x00` = 0 decimal
-- **Calculation**: `(51 × 256) + 0 = 13,056 + 0` = **51 decimal**
-- **Or using hex**: `0x3300` in Big Endian = **0x0033** = **51 decimal**
+  - Byte 3 (LSB/Low): `0x31` = 49 decimal
+  - Byte 4 (MSB/High): `0x00` = 0 decimal
+- **Calculation**: `0x31 + (0x00 × 256) = 49 + 0` = **49 dB**
+- **✓ Confirmed real-world value**
 
-**Example 2**: Response `AC 06 08 01 F4`
-- Value bytes: `01 F4` (Big Endian)
+**Example 2**: Response `AC 06 09 1C 00` (PM2.5 sensor)
+- Sensor ID: `0x09` = PM2.5
+- Value bytes: `1C 00` (Little Endian)
 - Byte breakdown:
+  - Low byte: `0x1C` = 28 decimal
+  - High byte: `0x00` = 0 decimal
+- **Calculation**: `0x1C + (0x00 × 256) = 28` = **28 µg/m³**
+- **✓ Confirmed real-world value**
+
+**Example 3**: Response `AC 06 13 9B 01` (eCO2 sensor)
+- Sensor ID: `0x13` = eCO2
+- Value bytes: `9B 01` (Little Endian)
+- Byte breakdown:
+  - Low byte: `0x9B` = 155 decimal
   - High byte: `0x01` = 1 decimal
-  - Low byte: `0xF4` = 244 decimal
-- **Calculation**: `(1 × 256) + 244` = **500 decimal**
-- **Use case**: Could be 50.0°C if scaled by ÷10
+- **Calculation**: `0x9B + (0x01 × 256) = 155 + 256` = **411 ppm**
+- **✓ Confirmed real-world value**
 
-**Example 3**: Response `AC 06 08 00 64`
-- Value bytes: `00 64` (Big Endian)
-- **Calculation**: `(0 × 256) + 100` = **100 decimal**
-- **Use case**: Could be 100% humidity or 100 µg/m³
-
-**Example 4**: Response `AC 06 08 FF FF`
-- Value bytes: `FF FF` (Big Endian)
-- **Calculation**: `(255 × 256) + 255` = **65,535 decimal** (maximum value)
-- **Use case**: Might indicate error or out of range
+**Example 4**: Response `AC 06 12 01 00` (TVOC sensor - special encoding)
+- Sensor ID: `0x12` = TVOC
+- Value bytes: `01 00` (Little Endian)
+- **Raw value**: `0x01 + (0x00 × 256)` = **1**
+- **Actual value**: **0.001 mg/m³** (special scaling factor)
+- **✓ Confirmed: This sensor uses a different encoding**
 
 #### Format Summary
 - **Data Type**: 16-bit unsigned integer
-- **Byte Order**: Big Endian (MSB first)
+- **Byte Order**: Little Endian (LSB first)
 - **Range**: 0 to 65535
-- **Parsing Formula**: `value = (high_byte × 256) + low_byte`
+- **Parsing Formula**: `value = low_byte + (high_byte × 256)`
+- **Python**: `int.from_bytes(value_bytes[:2], byteorder='little')`
 
 #### Analysis Needed
 - Determine which sensor ID corresponds to which physical sensor
@@ -220,12 +229,17 @@ When you write hexadecimal values on paper, you naturally write the most signifi
 - ✅ Request format: 3 bytes `[seq][06][sensor_id]`
 - ✅ Response format: `[seq][06][sensor_id][value_bytes]`
 - ✅ Sequence ID matching works
-- ✅ Value format: 2 bytes, Big Endian, unsigned 16-bit integer
-- ✅ Example: `33 00` = 51 decimal
+- ✅ Value format: 2 bytes, **Little Endian**, unsigned 16-bit integer
+- ✅ **Sensor ID mappings (confirmed)**:
+  - `0x08` = Noise Level (dB)
+  - `0x09` = PM2.5 (µg/m³)
+  - `0x11` = PM10 (µg/m³)
+  - `0x12` = TVOC (mg/m³, special encoding)
+  - `0x13` = eCO2 (ppm)
 
 ### To Be Determined
-- ❓ Exact mapping of sensor IDs to sensor types
-- ❓ Scaling factors and units for each sensor
+- ❓ Sensor IDs `0x01`, `0x06`, `0x0A` - not yet identified
+- ❓ Scaling factor for TVOC (0x12) - appears to use special encoding
 - ❓ Whether all sensors use 2-byte values or if some use different lengths
 - ❓ Other command types besides `0x06`
 - ❓ Error handling and timeout behavior
@@ -236,31 +250,35 @@ When you write hexadecimal values on paper, you naturally write the most signifi
 1. Connect to device via BLE
 2. Subscribe to notifications on 0xFFF4
 3. Write to 0xFFF1: [0xAC, 0x06, 0x08]
-   └─> Request sensor 0x08 with sequence ID 0xAC
-4. Receive from 0xFFF4: [0xAC, 0x06, 0x08, 0x33, 0x00]
-   └─> Response: seq=0xAC, cmd=0x06, sensor=0x08, value=0x3300
-5. Parse Big Endian value: 0x3300 = (0x33 × 256) + 0x00 = 51
+   └─> Request sensor 0x08 (Noise) with sequence ID 0xAC
+4. Receive from 0xFFF4: [0xAC, 0x06, 0x08, 0x31, 0x00]
+   └─> Response: seq=0xAC, cmd=0x06, sensor=0x08, value_bytes=[0x31, 0x00]
+5. Parse Little Endian value: 0x31 + (0x00 × 256) = 49 dB
 6. Repeat for other sensor IDs (0x01, 0x06, 0x09, 0x0A, 0x11, 0x12, 0x13)
 ```
 
 ### Detailed Example with Multiple Sensors
 
 ```python
-# Reading Temperature (hypothetical sensor 0x12)
-Send:    AC 06 12
-Receive: AC 06 12 00 E7    # 0x00E7 = 231 → maybe 23.1°C (÷10)
+# Reading Noise (confirmed sensor 0x08)
+Send:    AC 06 08
+Receive: AC 06 08 31 00    # Little Endian: 0x31 + (0x00 × 256) = 49 dB
 
-# Reading Humidity (hypothetical sensor 0x13)
-Send:    AD 06 13
-Receive: AD 06 13 00 33    # 0x0033 = 51 → 51% humidity
+# Reading PM2.5 (confirmed sensor 0x09)
+Send:    AD 06 09
+Receive: AD 06 09 1C 00    # Little Endian: 0x1C + (0x00 × 256) = 28 µg/m³
 
-# Reading PM2.5 (hypothetical sensor 0x06)
-Send:    AE 06 06
-Receive: AE 06 06 00 19    # 0x0019 = 25 → 25 µg/m³
+# Reading PM10 (confirmed sensor 0x11)
+Send:    AE 06 11
+Receive: AE 06 11 16 00    # Little Endian: 0x16 + (0x00 × 256) = 22 µg/m³
 
-# Reading PM10 (hypothetical sensor 0x08)
-Send:    AF 06 08
-Receive: AF 06 08 00 33    # 0x0033 = 51 → 51 µg/m³
+# Reading TVOC (confirmed sensor 0x12 - special encoding)
+Send:    AF 06 12
+Receive: AF 06 12 01 00    # Little Endian: 0x01 + (0x00 × 256) = 1 → 0.001 mg/m³
+
+# Reading eCO2 (confirmed sensor 0x13)
+Send:    B0 06 13
+Receive: B0 06 13 9B 01    # Little Endian: 0x9B + (0x01 × 256) = 155 + 256 = 411 ppm
 ```
 
 **Note**: Each request uses a different sequence ID (AC, AD, AE, AF) to track responses.

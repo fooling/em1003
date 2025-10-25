@@ -113,11 +113,17 @@ class EM1003Device:
             )
 
             # Parse value based on sensor type
-            # Value is in big-endian format (e.g., 0x3300 = 00 33 = 51)
+            # Value is in little-endian format (e.g., 0x31 0x00 = 49)
             if len(value_bytes) >= 2:
-                raw_value = int.from_bytes(value_bytes[:2], byteorder='big')
+                raw_value = int.from_bytes(value_bytes[:2], byteorder='little')
                 _LOGGER.info("Sensor %02x raw value: %d (0x%s)", sensor_id, raw_value, value_bytes[:2].hex())
-                self.sensor_data[sensor_id] = raw_value
+
+                # Apply special scaling for TVOC sensor (0x12)
+                if sensor_id == 0x12:
+                    # TVOC uses special encoding: raw value × 0.001
+                    self.sensor_data[sensor_id] = raw_value * 0.001
+                else:
+                    self.sensor_data[sensor_id] = raw_value
 
             # Set the future result if waiting
             if self._notify_future and not self._notify_future.done():

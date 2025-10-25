@@ -29,15 +29,15 @@ EM1003_NOTIFY_CHAR_UUID = "0000FFF4-0000-1000-8000-00805F9B34FB"  # Notify chara
 # Protocol Commands
 CMD_READ_SENSOR = 0x06  # Command to read sensor data
 
-# Sensor IDs (mapping to be confirmed through testing)
-SENSOR_ID_01 = 0x01  # Unknown - possibly Formaldehyde (HCHO)
-SENSOR_ID_06 = 0x06  # Unknown - possibly PM2.5
-SENSOR_ID_08 = 0x08  # Unknown - possibly PM10
-SENSOR_ID_09 = 0x09  # Unknown - possibly TVOC
-SENSOR_ID_0A = 0x0A  # Unknown - possibly eCO2
-SENSOR_ID_11 = 0x11  # Unknown - possibly Noise
-SENSOR_ID_12 = 0x12  # Unknown - possibly Temperature
-SENSOR_ID_13 = 0x13  # Unknown - possibly Humidity
+# Sensor IDs (confirmed through testing)
+SENSOR_ID_01 = 0x01  # Unknown - not yet identified
+SENSOR_ID_06 = 0x06  # Unknown - not yet identified
+SENSOR_ID_08 = 0x08  # ✓ Confirmed: Noise Level (dB)
+SENSOR_ID_09 = 0x09  # ✓ Confirmed: PM2.5 (µg/m³)
+SENSOR_ID_0A = 0x0A  # Unknown - not yet identified
+SENSOR_ID_11 = 0x11  # ✓ Confirmed: PM10 (µg/m³)
+SENSOR_ID_12 = 0x12  # ✓ Confirmed: TVOC (mg/m³, special encoding)
+SENSOR_ID_13 = 0x13  # ✓ Confirmed: eCO2 (ppm)
 
 # Sensor definitions
 SENSOR_TYPES = {
@@ -61,21 +61,21 @@ SENSOR_TYPES = {
     },
     SENSOR_ID_08: {
         "id": SENSOR_ID_08,
-        "name": "Sensor 08",
-        "key": "sensor_08",
-        "icon": "mdi:air-filter",
+        "name": "Noise Level",
+        "key": "noise",
+        "icon": "mdi:volume-high",
         "device_class": None,
-        "unit": "µg/m³",  # Assuming PM10
-        "note": "Possibly PM10",
+        "unit": "dB",
+        "note": "Confirmed: Noise level in decibels",
     },
     SENSOR_ID_09: {
         "id": SENSOR_ID_09,
-        "name": "Sensor 09",
-        "key": "sensor_09",
-        "icon": "mdi:molecule",
-        "device_class": None,
-        "unit": "ppb",  # Assuming TVOC
-        "note": "Possibly TVOC",
+        "name": "PM2.5",
+        "key": "pm25",
+        "icon": "mdi:air-filter",
+        "device_class": "pm25",
+        "unit": "µg/m³",
+        "note": "Confirmed: Particulate Matter 2.5µm",
     },
     SENSOR_ID_0A: {
         "id": SENSOR_ID_0A,
@@ -88,30 +88,30 @@ SENSOR_TYPES = {
     },
     SENSOR_ID_11: {
         "id": SENSOR_ID_11,
-        "name": "Sensor 11",
-        "key": "sensor_11",
-        "icon": "mdi:volume-high",
-        "device_class": None,
-        "unit": "dB",  # Assuming Noise
-        "note": "Possibly Noise",
+        "name": "PM10",
+        "key": "pm10",
+        "icon": "mdi:air-filter",
+        "device_class": "pm10",
+        "unit": "µg/m³",
+        "note": "Confirmed: Particulate Matter 10µm",
     },
     SENSOR_ID_12: {
         "id": SENSOR_ID_12,
-        "name": "Sensor 12",
-        "key": "sensor_12",
-        "icon": "mdi:thermometer",
-        "device_class": "temperature",
-        "unit": "°C",  # Assuming Temperature
-        "note": "Possibly Temperature",
+        "name": "TVOC",
+        "key": "tvoc",
+        "icon": "mdi:molecule",
+        "device_class": "volatile_organic_compounds",
+        "unit": "mg/m³",
+        "note": "Confirmed: Total Volatile Organic Compounds (special encoding: raw × 0.001)",
     },
     SENSOR_ID_13: {
         "id": SENSOR_ID_13,
-        "name": "Sensor 13",
-        "key": "sensor_13",
-        "icon": "mdi:water-percent",
-        "device_class": "humidity",
-        "unit": "%",  # Assuming Humidity
-        "note": "Possibly Humidity",
+        "name": "eCO2",
+        "key": "eco2",
+        "icon": "mdi:molecule-co2",
+        "device_class": "carbon_dioxide",
+        "unit": "ppm",
+        "note": "Confirmed: Equivalent CO2",
     },
 }
 
