@@ -4,8 +4,9 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from bleak import BleakClient, BleakScanner
+from bleak import BleakClient
 from bleak.exc import BleakError
+from bleak_retry_connector import establish_connection
 
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
@@ -58,7 +59,19 @@ async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str |
             _LOGGER.warning("Device not found when reading name: %s", mac_address)
             return None
 
-        async with BleakClient(device, timeout=DEVICE_TIMEOUT) as client:
+        # Use bleak-retry-connector for reliable connection
+        client = await establish_connection(
+            BleakClient,
+            device,
+            mac_address,
+            disconnected_callback=lambda _: None,
+            use_services_cache=True,
+            ble_device_callback=lambda: bluetooth.async_ble_device_from_address(
+                hass, mac_address, connectable=True
+            ),
+        )
+
+        try:
             _LOGGER.debug("Connected to device %s to read name", mac_address)
 
             # Read the Device Name characteristic (0x2A00)
@@ -67,6 +80,9 @@ async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str |
 
             _LOGGER.info("Read device name from %s: %s", mac_address, device_name)
             return device_name
+
+        finally:
+            await client.disconnect()
 
     except BleakError as err:
         _LOGGER.error("Bleak error reading device name from %s: %s", mac_address, err)
@@ -161,7 +177,19 @@ class EM1003Device:
                 _LOGGER.error("Device not found: %s", self.mac_address)
                 return None
 
-            async with BleakClient(device, timeout=DEVICE_TIMEOUT) as client:
+            # Use bleak-retry-connector for reliable connection
+            client = await establish_connection(
+                BleakClient,
+                device,
+                self.mac_address,
+                disconnected_callback=lambda _: None,
+                use_services_cache=True,
+                ble_device_callback=lambda: bluetooth.async_ble_device_from_address(
+                    self.hass, self.mac_address, connectable=True
+                ),
+            )
+
+            try:
                 _LOGGER.debug("Connected to device %s", self.mac_address)
 
                 # Subscribe to notifications
@@ -195,6 +223,9 @@ class EM1003Device:
 
                 # Return parsed value
                 return self.sensor_data.get(sensor_id)
+
+            finally:
+                await client.disconnect()
 
         except BleakError as err:
             _LOGGER.error("Bleak error reading sensor %02x: %s", sensor_id, err)
