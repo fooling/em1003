@@ -33,7 +33,7 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = []
+PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 
 async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str | None:
@@ -77,11 +77,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     _LOGGER.info("Setting up EM1003 device with MAC: %s", mac_address)
 
+    # Try to read device name from BLE device
+    device_name = await async_read_device_name(hass, mac_address)
+
+    if device_name:
+        _LOGGER.info("Successfully read device name: %s", device_name)
+    else:
+        _LOGGER.warning("Could not read device name, using default: %s", entry.title)
+        device_name = entry.title
+
     # Store device info in hass.data
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {
         CONF_MAC_ADDRESS: mac_address,
         "name": entry.title,
+        "device_name": device_name,
     }
 
     # Register services
