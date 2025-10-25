@@ -1,0 +1,80 @@
+scan_device:
+  name: Scan Device
+  description: Scan for a BLE device and display its information in the logs
+  fields:
+    mac_address:
+      name: MAC Address
+      description: The MAC address of the BLE device
+      required: true
+      example: "AA:BB:CC:DD:EE:FF"
+      selector:
+        text:
+
+discover_all:
+  name: Discover All
+  description: Discover all services and characteristics of the BLE device (full protocol dump)
+  fields:
+    mac_address:
+      name: MAC Address
+      description: The MAC address of the BLE device
+      required: true
+      example: "AA:BB:CC:DD:EE:FF"
+      selector:
+        text:
+
+list_services:
+  name: List Services
+  description: List all available GATT services on the BLE device
+  fields:
+    mac_address:
+      name: MAC Address
+      description: The MAC address of the BLE device
+      required: true
+      example: "AA:BB:CC:DD:EE:FF"
+      selector:
+        text:
+
+read_characteristic:
+  name: Read Characteristic
+  description: Read a specific GATT characteristic from the BLE device
+  fields:
+    mac_address:
+      name: MAC Address
+      description: The MAC address of the BLE device
+      required: true
+      example: "AA:BB:CC:DD:EE:FF"
+      selector:
+        text:
+    characteristic_uuid:
+      name: Characteristic UUID
+      description: The UUID of the characteristic to read
+      required: true
+      example: "00002a00-0000-1000-8000-00805f9b34fb"
+      selector:
+        text:
+
+write_characteristic:
+  name: Write Characteristic
+  description: Write data to a specific GATT characteristic on the BLE device
+  fields:
+    mac_address:
+      name: MAC Address
+      description: The MAC address of the BLE device
+      required: true
+      example: "AA:BB:CC:DD:EE:FF"
+      selector:
+        text:
+    characteristic_uuid:
+      name: Characteristic UUID
+      description: The UUID of the characteristic to write to
+      required: true
+      example: "00002a00-0000-1000-8000-00805f9b34fb"
+      selector:
+        text:
+    data:
+      name: Data
+      description: Data to write (hex string like "0102ff" or byte array like [1, 2, 255])
+      required: true
+      example: "0102ff"
+      selector:
+        text:
