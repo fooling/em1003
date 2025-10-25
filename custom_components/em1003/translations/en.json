@@ -3,9 +3,9 @@
     "step": {
       "user": {
         "title": "Add EM1003 BLE Sensor",
-        "description": "Enter the MAC address of your EM1003 (720环境宝3) BLE sensor.\n\nDiscovered {discovered} BLE devices nearby.",
+        "description": "Select your EM1003 (720环境宝3) BLE sensor from the discovered devices.\n\nFound {discovered} BLE devices nearby. If no devices are shown, you can enter the MAC address manually.",
         "data": {
-          "mac_address": "MAC Address (e.g., AA:BB:CC:DD:EE:FF)"
+          "mac_address": "Select Device / MAC Address"
         }
       },
       "bluetooth_confirm": {
