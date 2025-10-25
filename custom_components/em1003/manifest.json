@@ -1,0 +1,20 @@
+{
+  "domain": "em1003",
+  "name": "EM1003 BLE Sensor (720环境宝3)",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/yourusername/em1003",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "requirements": ["bleak>=0.21.0"],
+  "version": "0.0.1",
+  "bluetooth": [
+    {
+      "local_name": "EM1003*"
+    },
+    {
+      "local_name": "720*"
+    }
+  ]
+}

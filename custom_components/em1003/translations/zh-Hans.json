@@ -1,0 +1,24 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "添加 EM1003 蓝牙传感器",
+        "description": "输入您的 EM1003 (720环境宝3) 蓝牙传感器的 MAC 地址。\n\n附近发现了 {discovered} 个蓝牙设备。",
+        "data": {
+          "mac_address": "MAC 地址 (例如: AA:BB:CC:DD:EE:FF)"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "确认 EM1003 设备",
+        "description": "是否要将 {name} 添加到 Home Assistant？"
+      }
+    },
+    "error": {
+      "cannot_connect": "无法连接到设备",
+      "unknown": "发生未知错误"
+    },
+    "abort": {
+      "already_configured": "设备已配置"
+    }
+  }
+}

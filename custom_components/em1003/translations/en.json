@@ -1,0 +1,24 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add EM1003 BLE Sensor",
+        "description": "Enter the MAC address of your EM1003 (720环境宝3) BLE sensor.\n\nDiscovered {discovered} BLE devices nearby.",
+        "data": {
+          "mac_address": "MAC Address (e.g., AA:BB:CC:DD:EE:FF)"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "Confirm EM1003 Device",
+        "description": "Do you want to add {name} to Home Assistant?"
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the device",
+      "unknown": "Unexpected error occurred"
+    },
+    "abort": {
+      "already_configured": "Device is already configured"
+    }
+  }
+}
