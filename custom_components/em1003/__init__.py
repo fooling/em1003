@@ -360,25 +360,22 @@ class EM1003Device:
         # Wait if we recently disconnected to avoid connection abort errors
         await self._ensure_connection_delay()
 
-        # Get a fresh device reference to ensure we have the latest advertising data
-        _LOGGER.debug(
-            "[DIAG] Looking for device %s in Bluetooth cache...",
+        # IMPORTANT: Always perform active BLE scan to find device with valid RSSI
+        # Don't rely on cached device data as RSSI may be N/A (outdated)
+        _LOGGER.info(
+            "[DIAG] Performing active BLE scan for device %s...",
             self.mac_address
         )
-        device = bluetooth.async_ble_device_from_address(
-            self.hass, self.mac_address, connectable=True
-        )
 
-        if device:
-            _LOGGER.debug(
-                "[DIAG] Device %s found in cache (RSSI: %s)",
-                self.mac_address,
-                getattr(device, 'rssi', 'N/A')
-            )
-        else:
+        device = None
+        device_rssi = None
+        max_scan_attempts = 3
+        min_rssi_threshold = -90  # Don't connect if signal is weaker than -90 dBm
+
+        for scan_attempt in range(1, max_scan_attempts + 1):
             _LOGGER.info(
-                "[DIAG] Device %s not in cache, performing active BLE scan...",
-                self.mac_address
+                "[DIAG] Scan attempt %d/%d for %s",
+                scan_attempt, max_scan_attempts, self.mac_address
             )
 
             try:
@@ -393,66 +390,73 @@ class EM1003Device:
                     len(devices)
                 )
 
-                found = False
+                # Look for our target device in scan results
                 for scanned_device in devices:
-                    _LOGGER.debug(
-                        "[DIAG] Scanned device: %s (%s) RSSI: %s",
-                        scanned_device.address,
-                        scanned_device.name or "Unknown",
-                        scanned_device.rssi
-                    )
                     if scanned_device.address.upper() == self.mac_address.upper():
+                        device_rssi = scanned_device.rssi
+
                         _LOGGER.info(
-                            "[DIAG] ✓ Found target device %s during scan (Name: %s, RSSI: %s)",
+                            "[DIAG] ✓ Found target device %s (Name: %s, RSSI: %s dBm)",
                             self.mac_address,
                             scanned_device.name or "Unknown",
-                            scanned_device.rssi
+                            device_rssi if device_rssi is not None else "N/A"
                         )
-                        found = True
-                        break
 
-                if not found:
-                    _LOGGER.warning(
-                        "[DIAG] ✗ Device %s not found during scan. Scanned %d devices.",
-                        self.mac_address,
-                        len(devices)
-                    )
+                        # Validate RSSI before accepting the device
+                        if device_rssi is None:
+                            _LOGGER.warning(
+                                "[DIAG] ⚠ Device found but RSSI is N/A, continuing to scan for better signal..."
+                            )
+                            continue  # Keep scanning for valid RSSI
+                        elif device_rssi < min_rssi_threshold:
+                            _LOGGER.warning(
+                                "[DIAG] ⚠ Device found but signal too weak (RSSI: %s dBm < %s dBm threshold), "
+                                "continuing to scan for better signal...",
+                                device_rssi, min_rssi_threshold
+                            )
+                            continue  # Keep scanning for better signal
+                        else:
+                            # Good signal found!
+                            _LOGGER.info(
+                                "[DIAG] ✓ Device has acceptable signal strength (RSSI: %s dBm), proceeding with connection",
+                                device_rssi
+                            )
+                            device = scanned_device
+                            break
 
-                # Try to get device from cache again after scan
-                # The scan should have populated the cache
-                _LOGGER.debug(
-                    "[DIAG] Waiting 0.5s for cache update, then checking cache again..."
-                )
-                await asyncio.sleep(0.5)  # Small delay for cache update
-                device = bluetooth.async_ble_device_from_address(
-                    self.hass, self.mac_address, connectable=True
-                )
+                # If we found a device with good RSSI, stop scanning
+                if device is not None and device_rssi is not None:
+                    break
 
-                if device:
+                # If this isn't the last attempt, wait before next scan
+                if scan_attempt < max_scan_attempts:
+                    wait_time = 2.0 * scan_attempt  # Exponential backoff
                     _LOGGER.info(
-                        "[DIAG] ✓ Device %s now available in cache after scan",
-                        self.mac_address
+                        "[DIAG] Device not found with valid signal, waiting %.1f seconds before next scan...",
+                        wait_time
                     )
-                else:
-                    _LOGGER.warning(
-                        "[DIAG] ✗ Device %s still not in cache after scan",
-                        self.mac_address
-                    )
+                    await asyncio.sleep(wait_time)
 
             except Exception as scan_err:
                 _LOGGER.warning(
-                    "[DIAG] Error during BLE scan for %s: %s",
-                    self.mac_address,
-                    scan_err,
+                    "[DIAG] Error during BLE scan attempt %d/%d: %s",
+                    scan_attempt, max_scan_attempts, scan_err,
                     exc_info=True
                 )
 
+                if scan_attempt < max_scan_attempts:
+                    await asyncio.sleep(2.0)
+
+        # Check if we found a suitable device
         if not device:
             _LOGGER.error(
-                "[DIAG] ✗ Device %s not found after all attempts",
-                self.mac_address
+                "[DIAG] ✗ Device %s not found with valid RSSI after %d scan attempts",
+                self.mac_address, max_scan_attempts
             )
-            raise BleakError(f"Device not found: {self.mac_address}")
+            raise BleakError(
+                f"Device not found with valid signal: {self.mac_address}. "
+                "Make sure device is powered on, nearby, and not obstructed."
+            )
 
         # Establish connection with timeout and retry logic
         # Use fewer attempts with longer timeout to avoid overwhelming Bluetooth stack
@@ -623,16 +627,28 @@ class EM1003Device:
     async def _ensure_connected(self) -> BleakClient:
         """Ensure we have an active connection, reusing existing if possible.
 
+        This method prioritizes reusing existing connections:
+        1. If self._client exists and is connected, use it immediately
+        2. Otherwise, establish a new connection via active BLE scanning
+
         Returns:
             Connected BleakClient instance
 
         Raises:
             BleakError: If connection fails or fast-fail is active
         """
-        # Check if we already have a valid connection
+        # PRIORITY 1: Check if we already have a valid connection
         if self._client and self._client.is_connected:
-            _LOGGER.debug("[CONN] Reusing existing connection to %s", self.mac_address)
+            _LOGGER.info(
+                "[CONN] ✓ Reusing existing active connection to %s",
+                self.mac_address
+            )
             return self._client
+
+        _LOGGER.debug(
+            "[CONN] No active connection to %s, need to establish new connection",
+            self.mac_address
+        )
 
         # Fast-fail if we recently failed to connect (unless circuit breaker is testing)
         if self._last_connection_failure_time is not None:
@@ -652,8 +668,11 @@ class EM1003Device:
                     f"will retry after {remaining:.0f}s"
                 )
 
-        # Need to establish a new connection
-        _LOGGER.debug("[CONN] Establishing new connection to %s", self.mac_address)
+        # PRIORITY 2: Need to establish a new connection via active BLE scanning
+        _LOGGER.info(
+            "[CONN] Establishing new connection to %s via active BLE scan",
+            self.mac_address
+        )
 
         try:
             self._client = await self._establish_connection()
