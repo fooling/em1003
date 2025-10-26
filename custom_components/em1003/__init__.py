@@ -393,7 +393,7 @@ class EM1003Device:
                 # Look for our target device in scan results
                 for scanned_device in devices:
                     if scanned_device.address.upper() == self.mac_address.upper():
-                        device_rssi = scanned_device.rssi
+                        device_rssi = getattr(scanned_device, 'rssi', None)
 
                         _LOGGER.info(
                             "[DIAG] ✓ Found target device %s (Name: %s, RSSI: %s dBm)",
@@ -785,8 +785,8 @@ class EM1003Device:
                     # Formaldehyde: (raw - 16384) / 1000
                     self.sensor_data[sensor_id] = (raw_value - 16384) / 1000.0
                     formula_desc = f"({raw_value} - 16384) / 1000"
-                elif sensor_id in [0x02, 0x11, 0x12, 0x13]:
-                    # PM2.5, PM10, TVOC, eCO2: raw value directly
+                elif sensor_id in [0x08, 0x09, 0x11, 0x12, 0x13]:
+                    # Noise, PM2.5, PM10, TVOC, eCO2: raw value directly
                     self.sensor_data[sensor_id] = raw_value
                     formula_desc = f"{raw_value} (direct)"
                 else:
