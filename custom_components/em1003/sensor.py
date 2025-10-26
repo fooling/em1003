@@ -138,17 +138,18 @@ class EM1003Sensor(CoordinatorEntity, SensorEntity):
         self._attr_icon = sensor_info["icon"]
         self._attr_native_unit_of_measurement = sensor_info.get("unit")
 
-        # Set device class if available - use explicit mapping for better compatibility
+        # Set device class if available - use explicit mapping with getattr for compatibility
         device_class_str = sensor_info.get("device_class")
         if device_class_str:
             # Map string device classes to SensorDeviceClass enum
+            # Use getattr to handle older HA versions that may not have all device classes
             device_class_map = {
-                "temperature": SensorDeviceClass.TEMPERATURE,
-                "humidity": SensorDeviceClass.HUMIDITY,
-                "pm25": SensorDeviceClass.PM25,
-                "pm10": SensorDeviceClass.PM10,
-                "carbon_dioxide": SensorDeviceClass.CARBON_DIOXIDE,
-                "volatile_organic_compounds": SensorDeviceClass.VOLATILE_ORGANIC_COMPOUNDS,
+                "temperature": getattr(SensorDeviceClass, "TEMPERATURE", None),
+                "humidity": getattr(SensorDeviceClass, "HUMIDITY", None),
+                "pm25": getattr(SensorDeviceClass, "PM25", None),
+                "pm10": getattr(SensorDeviceClass, "PM10", None),
+                "carbon_dioxide": getattr(SensorDeviceClass, "CARBON_DIOXIDE", None),
+                "volatile_organic_compounds": getattr(SensorDeviceClass, "VOLATILE_ORGANIC_COMPOUNDS", None),
             }
             self._attr_device_class = device_class_map.get(device_class_str)
             if self._attr_device_class:
@@ -158,9 +159,9 @@ class EM1003Sensor(CoordinatorEntity, SensorEntity):
                     sensor_id,
                     self._attr_device_class
                 )
-            else:
-                _LOGGER.warning(
-                    "Unknown device_class '%s' for sensor %s (0x%02x)",
+            elif device_class_str:
+                _LOGGER.info(
+                    "Device class '%s' not available in this Home Assistant version for sensor %s (0x%02x)",
                     device_class_str,
                     sensor_info["name"],
                     sensor_id
