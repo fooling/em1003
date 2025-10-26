@@ -190,7 +190,8 @@ async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str |
             device,
             mac_address,
             disconnected_callback=lambda _: None,
-            max_attempts=5,  # Increased retry attempts
+            max_attempts=3,  # Reduced to avoid overwhelming Bluetooth stack
+            timeout=30.0,
         )
 
         try:
@@ -235,6 +236,10 @@ class EM1003Device:
             failure_threshold=3,
             open_duration=60.0
         )
+
+        # Connection abort tracking for adaptive backoff
+        self._connection_abort_count = 0
+        self._last_connection_abort_time: float | None = None
 
     def _get_random_sequence_id(self) -> int:
         """Get a random unused sequence ID.
@@ -295,14 +300,67 @@ class EM1003Device:
             )
 
     async def _ensure_connection_delay(self) -> None:
-        """Ensure sufficient delay since last disconnect to avoid connection issues."""
+        """Ensure sufficient delay since last disconnect to avoid connection issues.
+
+        Uses adaptive backoff based on recent connection abort errors:
+        - Base delay: 2 seconds (increased from 1 to give Bluetooth stack more time)
+        - After connection abort: adds exponential backoff
+        - Resets abort count after 5 minutes of no abort errors
+        """
+        current_time = time.time()
+
+        # Reset connection abort counter if it's been a while since last abort
+        if self._last_connection_abort_time is not None:
+            time_since_abort = current_time - self._last_connection_abort_time
+            if time_since_abort > 300:  # 5 minutes
+                if self._connection_abort_count > 0:
+                    _LOGGER.info(
+                        "[BACKOFF] Resetting connection abort count (%d) after %.0f seconds of stability",
+                        self._connection_abort_count,
+                        time_since_abort
+                    )
+                self._connection_abort_count = 0
+                self._last_connection_abort_time = None
+
+        # Calculate base delay with adaptive backoff for connection aborts
+        base_delay = 2.0  # Increased from 1.0 to 2.0 seconds
+
+        # Add exponential backoff for repeated connection aborts
+        # abort_count: 0 → 0s, 1 → 2s, 2 → 4s, 3 → 8s, 4 → 16s, max 30s
+        abort_backoff = 0.0
+        if self._connection_abort_count > 0:
+            abort_backoff = min(2.0 ** self._connection_abort_count, 30.0)
+            _LOGGER.info(
+                "[BACKOFF] Adding %.1fs backoff for %d recent connection abort(s)",
+                abort_backoff,
+                self._connection_abort_count
+            )
+
+        min_delay = base_delay + abort_backoff
+
+        # Wait if we recently disconnected
         if self._last_disconnect_time is not None:
-            time_since_disconnect = time.time() - self._last_disconnect_time
-            min_delay = 1.0  # Minimum 1 second between connection attempts
+            time_since_disconnect = current_time - self._last_disconnect_time
             if time_since_disconnect < min_delay:
                 delay = min_delay - time_since_disconnect
-                _LOGGER.debug("Waiting %.2f seconds before reconnecting to %s", delay, self.mac_address)
+                _LOGGER.info(
+                    "[BACKOFF] Waiting %.2fs before reconnecting (base=%.1fs + abort_backoff=%.1fs, "
+                    "time_since_disconnect=%.2fs)",
+                    delay, base_delay, abort_backoff, time_since_disconnect
+                )
                 await asyncio.sleep(delay)
+            else:
+                _LOGGER.debug(
+                    "[BACKOFF] No wait needed, %.2fs elapsed since disconnect (min_delay=%.2fs)",
+                    time_since_disconnect, min_delay
+                )
+        elif abort_backoff > 0:
+            # No recent disconnect but we have abort history, add safety delay
+            _LOGGER.info(
+                "[BACKOFF] Adding %.2fs safety delay due to %d recent connection abort(s)",
+                abort_backoff, self._connection_abort_count
+            )
+            await asyncio.sleep(abort_backoff)
 
     async def _establish_connection(self) -> BleakClient:
         """Establish a connection to the device with proper error handling.
@@ -416,7 +474,7 @@ class EM1003Device:
             raise BleakError(f"Device not found: {self.mac_address}")
 
         # Establish connection with timeout and retry logic
-        # Use a longer timeout and more attempts to handle flaky connections
+        # Use fewer attempts with longer timeout to avoid overwhelming Bluetooth stack
         _LOGGER.debug(
             "[DIAG] Attempting to establish connection to %s using bleak-retry-connector...",
             self.mac_address
@@ -428,7 +486,7 @@ class EM1003Device:
                 device,
                 self.mac_address,
                 disconnected_callback=lambda _: None,
-                max_attempts=5,
+                max_attempts=3,  # Reduced from 5 to 3 to avoid stack exhaustion
                 timeout=30.0,  # 30 second timeout per attempt
             )
 
@@ -436,15 +494,46 @@ class EM1003Device:
                 "[DIAG] ✓ Successfully connected to %s",
                 self.mac_address
             )
+
+            # Reset connection abort tracking on successful connection
+            if self._connection_abort_count > 0:
+                _LOGGER.info(
+                    "[BACKOFF] Connection successful, resetting abort count from %d to 0",
+                    self._connection_abort_count
+                )
+                self._connection_abort_count = 0
+                self._last_connection_abort_time = None
+
             return client
 
         except Exception as conn_err:
-            _LOGGER.error(
-                "[DIAG] ✗ Failed to connect to %s: %s",
-                self.mac_address,
-                conn_err,
-                exc_info=True
+            # Check if this is a connection abort error
+            error_message = str(conn_err).lower()
+            is_connection_abort = (
+                "connection abort" in error_message or
+                "software caused connection abort" in error_message
             )
+
+            if is_connection_abort:
+                self._connection_abort_count += 1
+                self._last_connection_abort_time = time.time()
+                _LOGGER.warning(
+                    "[DIAG] ✗ Connection abort error #%d for %s: %s",
+                    self._connection_abort_count,
+                    self.mac_address,
+                    conn_err
+                )
+                _LOGGER.info(
+                    "[BACKOFF] Next connection attempt will wait an additional %.1fs",
+                    min(2.0 ** self._connection_abort_count, 30.0)
+                )
+            else:
+                _LOGGER.error(
+                    "[DIAG] ✗ Failed to connect to %s: %s",
+                    self.mac_address,
+                    conn_err,
+                    exc_info=True
+                )
             raise
 
     def _notification_handler(self, sender, data: bytearray) -> None:
@@ -1076,7 +1165,8 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 device,
                 mac_address,
                 disconnected_callback=lambda _: None,
-                max_attempts=5,  # Increased retry attempts
+                max_attempts=3,  # Reduced to avoid overwhelming Bluetooth stack
+                timeout=30.0,
             )
 
             try:
@@ -1145,7 +1235,8 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 device,
                 mac_address,
                 disconnected_callback=lambda _: None,
-                max_attempts=5,  # Increased retry attempts
+                max_attempts=3,  # Reduced to avoid overwhelming Bluetooth stack
+                timeout=30.0,
             )
 
             try:
@@ -1185,7 +1276,8 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 device,
                 mac_address,
                 disconnected_callback=lambda _: None,
-                max_attempts=5,  # Increased retry attempts
+                max_attempts=3,  # Reduced to avoid overwhelming Bluetooth stack
+                timeout=30.0,
             )
 
             try:
@@ -1245,7 +1337,8 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 device,
                 mac_address,
                 disconnected_callback=lambda _: None,
-                max_attempts=5,  # Increased retry attempts
+                max_attempts=3,  # Reduced to avoid overwhelming Bluetooth stack
+                timeout=30.0,
             )
 
             try:
