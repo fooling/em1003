@@ -65,18 +65,20 @@ class CircuitBreaker:
     - HALF_OPEN: After timeout, allow one test request
     """
 
-    def __init__(self, failure_threshold: int = 3, open_duration: float = 60.0):
+    def __init__(self, failure_threshold: int = 3, open_duration: float = 60.0, max_backoff: float = 3600.0):
         """Initialize circuit breaker.
 
         Args:
             failure_threshold: Number of failures before opening circuit
-            open_duration: Seconds to wait before entering half-open state
+            open_duration: Base seconds to wait before entering half-open state
+            max_backoff: Maximum backoff duration in seconds (default: 1 hour)
         """
         self.state = "CLOSED"
         self.failure_count = 0
         self.failure_threshold = failure_threshold
         self.open_time: float | None = None
-        self.open_duration = open_duration
+        self.base_open_duration = open_duration
+        self.max_backoff = max_backoff
 
     def record_success(self) -> None:
         """Record successful operation - reset to CLOSED state."""
@@ -97,11 +99,17 @@ class CircuitBreaker:
         if self.failure_count >= self.failure_threshold:
             self.state = "OPEN"
             self.open_time = time.time()
+
+            # Calculate exponential backoff: base_duration * 2^(failures - threshold)
+            # Example: 3 failures → 60s, 4 → 120s, 5 → 240s, 6 → 480s, etc.
+            backoff_multiplier = 2 ** (self.failure_count - self.failure_threshold)
+            open_duration = min(self.base_open_duration * backoff_multiplier, self.max_backoff)
+
             _LOGGER.warning(
                 "[CIRCUIT] Circuit OPEN due to %d consecutive failures. "
-                "Blocking requests for %.0f seconds",
+                "Blocking requests for %.0f seconds (exponential backoff)",
                 self.failure_count,
-                self.open_duration
+                open_duration
             )
 
     def can_attempt(self) -> tuple[bool, str]:
@@ -119,17 +127,27 @@ class CircuitBreaker:
                 self.state = "CLOSED"
                 return True, "Circuit reset"
 
+            # Calculate current open duration with exponential backoff
+            backoff_multiplier = 2 ** (self.failure_count - self.failure_threshold)
+            open_duration = min(self.base_open_duration * backoff_multiplier, self.max_backoff)
+
             elapsed = time.time() - self.open_time
-            if elapsed >= self.open_duration:
+            if elapsed >= open_duration:
+                # CRITICAL FIX: Reset failure_count when entering HALF_OPEN
+                # This prevents infinite accumulation of failures
+                previous_failures = self.failure_count
+                self.failure_count = 0
                 self.state = "HALF_OPEN"
                 _LOGGER.info(
-                    "[CIRCUIT] Circuit entering HALF_OPEN state after %.0f seconds",
-                    elapsed
+                    "[CIRCUIT] Circuit entering HALF_OPEN state after %.0f seconds "
+                    "(was %d failures, now testing recovery)",
+                    elapsed,
+                    previous_failures
                 )
                 return True, "Circuit half-open (testing)"
 
-            remaining = self.open_duration - elapsed
-            return False, f"Circuit open ({remaining:.0f}s remaining)"
+            remaining = open_duration - elapsed
+            return False, f"Circuit open ({remaining:.0f}s remaining, {self.failure_count} failures)"
 
         else:  # HALF_OPEN
             return True, "Circuit half-open (testing)"
@@ -139,11 +157,15 @@ class CircuitBreaker:
         if self.state == "CLOSED":
             return f"CLOSED (failures: {self.failure_count})"
         elif self.state == "OPEN" and self.open_time:
+            # Calculate current open duration with exponential backoff
+            backoff_multiplier = 2 ** (self.failure_count - self.failure_threshold)
+            open_duration = min(self.base_open_duration * backoff_multiplier, self.max_backoff)
+
             elapsed = time.time() - self.open_time
-            remaining = max(0, self.open_duration - elapsed)
-            return f"OPEN (blocking for {remaining:.0f}s)"
+            remaining = max(0, open_duration - elapsed)
+            return f"OPEN (blocking for {remaining:.0f}s, {self.failure_count} failures)"
         else:
-            return "HALF_OPEN (testing)"
+            return f"HALF_OPEN (testing, {self.failure_count} failures)"
 
 
 async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str | None:
