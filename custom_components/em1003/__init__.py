@@ -402,12 +402,15 @@ class EM1003Device:
                             device_rssi if device_rssi is not None else "N/A"
                         )
 
-                        # Validate RSSI before accepting the device
+                        # Validate RSSI if available, otherwise accept device as found
                         if device_rssi is None:
-                            _LOGGER.warning(
-                                "[DIAG] ⚠ Device found but RSSI is N/A, continuing to scan for better signal..."
+                            # RSSI not available from BleakScanner.discover()
+                            # But device was found, so it's in range - proceed with connection
+                            _LOGGER.info(
+                                "[DIAG] ✓ Device found (RSSI not available from scanner, proceeding anyway)"
                             )
-                            continue  # Keep scanning for valid RSSI
+                            device = scanned_device
+                            break
                         elif device_rssi < min_rssi_threshold:
                             _LOGGER.warning(
                                 "[DIAG] ⚠ Device found but signal too weak (RSSI: %s dBm < %s dBm threshold), "
@@ -424,8 +427,8 @@ class EM1003Device:
                             device = scanned_device
                             break
 
-                # If we found a device with good RSSI, stop scanning
-                if device is not None and device_rssi is not None:
+                # If we found a device, stop scanning (either with good RSSI or RSSI N/A)
+                if device is not None:
                     break
 
                 # If this isn't the last attempt, wait before next scan
@@ -450,11 +453,11 @@ class EM1003Device:
         # Check if we found a suitable device
         if not device:
             _LOGGER.error(
-                "[DIAG] ✗ Device %s not found with valid RSSI after %d scan attempts",
+                "[DIAG] ✗ Device %s not found after %d scan attempts",
                 self.mac_address, max_scan_attempts
             )
             raise BleakError(
-                f"Device not found with valid signal: {self.mac_address}. "
+                f"Device not found: {self.mac_address}. "
                 "Make sure device is powered on, nearby, and not obstructed."
             )
 
