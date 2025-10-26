@@ -190,7 +190,8 @@ async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str |
             device,
             mac_address,
             disconnected_callback=lambda _: None,
-            max_attempts=5,  # Increased retry attempts
+            max_attempts=3,  # Reduced to avoid overwhelming Bluetooth stack
+            timeout=30.0,
         )
 
         try:
@@ -235,6 +236,10 @@ class EM1003Device:
             failure_threshold=3,
             open_duration=60.0
         )
+
+        # Connection abort tracking for adaptive backoff
+        self._connection_abort_count = 0
+        self._last_connection_abort_time: float | None = None
 
     def _get_random_sequence_id(self) -> int:
         """Get a random unused sequence ID.
@@ -295,14 +300,45 @@ class EM1003Device:
             )
 
     async def _ensure_connection_delay(self) -> None:
-        """Ensure sufficient delay since last disconnect to avoid connection issues."""
+        """Ensure sufficient delay since last disconnect to avoid connection issues.
+
+        Uses adaptive backoff based on recent connection abort errors:
+        - Base delay: 2 seconds (increased from 1 to give Bluetooth stack more time)
+        - After connection abort: adds exponential backoff
+        - Resets abort count after 5 minutes of no abort errors
+        """
+        current_time = time.time()
+
+        # Reset connection abort counter if it's been a while since last abort
+        if self._last_connection_abort_time is not None:
+            time_since_abort = current_time - self._last_connection_abort_time
+            if time_since_abort > 300:  # 5 minutes
+                self._connection_abort_count = 0
+                self._last_connection_abort_time = None
+
+        # Calculate base delay with adaptive backoff for connection aborts
+        base_delay = 2.0  # Increased from 1.0 to 2.0 seconds
+
+        # Add exponential backoff for repeated connection aborts
+        # abort_count: 0 → 0s, 1 → 2s, 2 → 4s, 3 → 8s, 4 → 16s, max 30s
+        abort_backoff = 0.0
+        if self._connection_abort_count > 0:
+            abort_backoff = min(2.0 ** self._connection_abort_count, 30.0)
+
+        min_delay = base_delay + abort_backoff
+
+        # Wait if we recently disconnected
         if self._last_disconnect_time is not None:
-            time_since_disconnect = time.time() - self._last_disconnect_time
-            min_delay = 1.0  # Minimum 1 second between connection attempts
+            time_since_disconnect = current_time - self._last_disconnect_time
             if time_since_disconnect < min_delay:
                 delay = min_delay - time_since_disconnect
-                _LOGGER.debug("Waiting %.2f seconds before reconnecting to %s", delay, self.mac_address)
+                if abort_backoff > 0:
+                    _LOGGER.info("Waiting %.1fs before retry (connection abort backoff)", delay)
                 await asyncio.sleep(delay)
+        elif abort_backoff > 0:
+            # No recent disconnect but we have abort history, add safety delay
+            _LOGGER.info("Waiting %.1fs before retry (connection abort backoff)", abort_backoff)
+            await asyncio.sleep(abort_backoff)
 
     async def _establish_connection(self) -> BleakClient:
         """Establish a connection to the device with proper error handling.
@@ -416,7 +452,7 @@ class EM1003Device:
             raise BleakError(f"Device not found: {self.mac_address}")
 
         # Establish connection with timeout and retry logic
-        # Use a longer timeout and more attempts to handle flaky connections
+        # Use fewer attempts with longer timeout to avoid overwhelming Bluetooth stack
         _LOGGER.debug(
             "[DIAG] Attempting to establish connection to %s using bleak-retry-connector...",
             self.mac_address
@@ -428,7 +464,7 @@ class EM1003Device:
                 device,
                 self.mac_address,
                 disconnected_callback=lambda _: None,
-                max_attempts=5,
+                max_attempts=3,  # Reduced from 5 to 3 to avoid stack exhaustion
                 timeout=30.0,  # 30 second timeout per attempt
             )
 
@@ -436,15 +472,36 @@ class EM1003Device:
                 "[DIAG] ✓ Successfully connected to %s",
                 self.mac_address
             )
+
+            # Reset connection abort tracking on successful connection
+            if self._connection_abort_count > 0:
+                self._connection_abort_count = 0
+                self._last_connection_abort_time = None
+
             return client
 
         except Exception as conn_err:
-            _LOGGER.error(
-                "[DIAG] ✗ Failed to connect to %s: %s",
-                self.mac_address,
-                conn_err,
-                exc_info=True
+            # Check if this is a connection abort error
+            error_message = str(conn_err).lower()
+            is_connection_abort = (
+                "connection abort" in error_message or
+                "software caused connection abort" in error_message
             )
+
+            if is_connection_abort:
+                self._connection_abort_count += 1
+                self._last_connection_abort_time = time.time()
+                _LOGGER.warning(
+                    "[DIAG] ✗ Connection abort for %s (will use backoff on retry)",
+                    self.mac_address
+                )
+            else:
+                _LOGGER.error(
+                    "[DIAG] ✗ Failed to connect to %s: %s",
+                    self.mac_address,
+                    conn_err,
+                    exc_info=True
+                )
             raise
 
     def _notification_handler(self, sender, data: bytearray) -> None:
@@ -465,14 +522,6 @@ class EM1003Device:
             sensor_id = data[2]
             value_bytes = data[3:]
 
-            # Special logging for problematic sensors
-            if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                sensor_info = SENSOR_TYPES.get(sensor_id, {})
-                sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
-                _LOGGER.warning(
-                    "[TRACK-%s] Step 1: Notification received - seq=%02x, cmd=%02x, raw_data=%s, value_bytes=%s",
-                    sensor_name, seq_id, cmd_type, data.hex(), value_bytes.hex()
-                )
 
             # Find matching pending request using (seq_id, sensor_id) key
             request_key = (seq_id, sensor_id)
@@ -483,26 +532,16 @@ class EM1003Device:
                     sensor_info = SENSOR_TYPES.get(sensor_id, {})
                     sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
                     _LOGGER.warning(
-                        "[TRACK-%s] Step 2: ✗ NO MATCHING REQUEST FOUND - seq=%02x, sensor=%02x, value=%s. "
-                        "Current pending requests: %s",
-                        sensor_name, seq_id, sensor_id, value_bytes.hex(),
-                        {f"(seq={k[0]:02x},sensor={k[1]:02x})": f"age={time.time()-v.timestamp:.1f}s"
-                         for k, v in self._pending_requests.items()}
+                        "[%s] Unexpected response: seq=%02x, no matching request",
+                        sensor_name, seq_id
                     )
-                _LOGGER.warning(
-                    "[RESP] ✗ Received unexpected response: seq=%02x, sensor=%02x, value=%s "
-                    "(no matching pending request)",
-                    seq_id, sensor_id, value_bytes.hex()
-                )
+                else:
+                    _LOGGER.warning(
+                        "[RESP] ✗ Received unexpected response: seq=%02x, sensor=%02x, value=%s "
+                        "(no matching pending request)",
+                        seq_id, sensor_id, value_bytes.hex()
+                    )
                 return
-
-            if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                sensor_info = SENSOR_TYPES.get(sensor_id, {})
-                sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
-                _LOGGER.warning(
-                    "[TRACK-%s] Step 2: ✓ Matched pending request - seq=%02x, request_age=%.2fs",
-                    sensor_name, seq_id, time.time() - pending_request.timestamp
-                )
 
             _LOGGER.debug(
                 "[RESP] ✓ Matched response: seq=%02x, cmd=%02x, sensor=%02x, value=%s",
@@ -518,15 +557,6 @@ class EM1003Device:
                 sensor_info = SENSOR_TYPES.get(sensor_id, {})
                 sensor_name = sensor_info.get("name", f"Unknown(0x{sensor_id:02x})")
 
-                if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                    _LOGGER.warning(
-                        "[TRACK-%s] Step 3: Parsing value - value_bytes=%s, length=%d",
-                        sensor_name, value_bytes.hex(), len(value_bytes)
-                    )
-                    _LOGGER.warning(
-                        "[TRACK-%s] Step 3: Raw value parsed - byte0=0x%02x, byte1=0x%02x, raw_value=%d",
-                        sensor_name, value_bytes[0], value_bytes[1] if len(value_bytes) > 1 else 0, raw_value
-                    )
 
                 _LOGGER.debug(
                     "[RESP] Sensor %s (0x%02x) raw value: %d (bytes: %s)",
@@ -549,29 +579,23 @@ class EM1003Device:
                 elif sensor_id == 0x11:
                     # PM10: raw value directly
                     self.sensor_data[sensor_id] = raw_value
-                    _LOGGER.warning("[TRACK-PM10] Step 4: Conversion applied - raw_value=%d, final_value=%d µg/m³",
-                                  raw_value, self.sensor_data[sensor_id])
+                    if sensor_id in [0x11, 0x12, 0x13]:
+                        _LOGGER.debug("[%s] Parsed: raw=%d → value=%d", sensor_name, raw_value, self.sensor_data[sensor_id])
                 elif sensor_id == 0x12:
                     # TVOC: raw value is directly in µg/m³
                     # Device returns: raw * 0.001 mg/m³, which equals raw * 0.001 * 1000 = raw µg/m³
                     self.sensor_data[sensor_id] = raw_value
-                    _LOGGER.warning("[TRACK-TVOC] Step 4: Conversion applied - raw_value=%d, final_value=%d µg/m³",
-                                  raw_value, self.sensor_data[sensor_id])
+                    if sensor_id in [0x11, 0x12, 0x13]:
+                        _LOGGER.debug("[%s] Parsed: raw=%d → value=%d", sensor_name, raw_value, self.sensor_data[sensor_id])
                 elif sensor_id == 0x13:
                     # eCO2: raw value directly
                     self.sensor_data[sensor_id] = raw_value
-                    _LOGGER.warning("[TRACK-eCO2] Step 4: Conversion applied - raw_value=%d, final_value=%d ppm",
-                                  raw_value, self.sensor_data[sensor_id])
+                    if sensor_id in [0x11, 0x12, 0x13]:
+                        _LOGGER.debug("[%s] Parsed: raw=%d → value=%d", sensor_name, raw_value, self.sensor_data[sensor_id])
                 else:
                     # Other sensors use raw value directly (PM2.5, Noise)
                     self.sensor_data[sensor_id] = raw_value
                     _LOGGER.debug("[RESP] %s: raw value %d (no conversion)", sensor_name, raw_value)
-
-                if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                    _LOGGER.warning(
-                        "[TRACK-%s] Step 5: Stored in sensor_data - sensor_data[0x%02x] = %s",
-                        sensor_name, sensor_id, self.sensor_data.get(sensor_id)
-                    )
 
                 _LOGGER.info(
                     "[RESP] ✓ %s (0x%02x) = %s %s",
@@ -585,8 +609,8 @@ class EM1003Device:
                     sensor_info = SENSOR_TYPES.get(sensor_id, {})
                     sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
                     _LOGGER.warning(
-                        "[TRACK-%s] Step 3: ✗ VALUE TOO SHORT - value_bytes=%s, length=%d (need at least 2)",
-                        sensor_name, value_bytes.hex(), len(value_bytes)
+                        "[%s] ✗ Value too short: got %d bytes, need at least 2",
+                        sensor_name, len(value_bytes)
                     )
 
             # Complete the future and remove from pending requests
@@ -776,9 +800,9 @@ class EM1003Device:
                             sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
 
                             if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                                _LOGGER.warning(
-                                    "[TRACK-%s] Step 0: Preparing request - seq=%02x, sensor=0x%02x, request_data=%s",
-                                    sensor_name, seq_id, sensor_id, request.hex()
+                                _LOGGER.info(
+                                    "[%s] Requesting sensor 0x%02x (seq=%02x)",
+                                    sensor_name, sensor_id, seq_id
                                 )
 
                             _LOGGER.debug(
@@ -796,22 +820,10 @@ class EM1003Device:
                             request_key = (seq_id, sensor_id)
                             self._pending_requests[request_key] = pending_request
 
-                            if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                                _LOGGER.warning(
-                                    "[TRACK-%s] Step 0.5: Pending request created - request_key=(seq=%02x,sensor=%02x), "
-                                    "timestamp=%.2f, total_pending=%d",
-                                    sensor_name, seq_id, sensor_id, pending_request.timestamp,
-                                    len(self._pending_requests)
-                                )
 
                             # Send request
                             await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
 
-                            if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                                _LOGGER.warning(
-                                    "[TRACK-%s] Step 0.8: Request sent to device via write_gatt_char, now waiting for response...",
-                                    sensor_name
-                                )
 
                             # Wait for response with timeout
                             try:
@@ -821,10 +833,9 @@ class EM1003Device:
                                 results[sensor_id] = value
 
                                 if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                                    _LOGGER.warning(
-                                        "[TRACK-%s] Step 6: ✓ Response received and processed - value=%s, "
-                                        "stored in results[0x%02x]",
-                                        sensor_name, value, sensor_id
+                                    _LOGGER.info(
+                                        "[%s] ✓ Got value: %s",
+                                        sensor_name, value
                                     )
 
                                 _LOGGER.debug(
@@ -834,14 +845,14 @@ class EM1003Device:
                             except asyncio.TimeoutError:
                                 if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
                                     _LOGGER.warning(
-                                        "[TRACK-%s] Step X: ✗ TIMEOUT after 5.0s - No response received from device. "
-                                        "Request was: seq=%02x, sensor=0x%02x",
-                                        sensor_name, seq_id, sensor_id
+                                        "[%s] ✗ TIMEOUT (5s) - sensor 0x%02x not responding",
+                                        sensor_name, sensor_id
                                     )
-                                _LOGGER.warning(
-                                    "[REQ] [%d/%d] ✗ Timeout waiting for sensor 0x%02x response (seq=%02x)",
-                                    idx, sensor_count, sensor_id, seq_id
-                                )
+                                else:
+                                    _LOGGER.warning(
+                                        "[REQ] [%d/%d] ✗ Timeout waiting for sensor 0x%02x response (seq=%02x)",
+                                        idx, sensor_count, sensor_id, seq_id
+                                    )
                                 results[sensor_id] = None
                                 # Clean up pending request on timeout
                                 self._pending_requests.pop(request_key, None)
@@ -852,14 +863,15 @@ class EM1003Device:
 
                         except BleakError as err:
                             if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                                _LOGGER.warning(
-                                    "[TRACK-%s] Step X: ✗ BLEAK ERROR - %s. Request was: seq=%02x, sensor=0x%02x",
-                                    sensor_name, err, seq_id, sensor_id
+                                _LOGGER.error(
+                                    "[%s] ✗ BLE error: %s",
+                                    sensor_name, err
                                 )
-                            _LOGGER.error(
-                                "[REQ] [%d/%d] ✗ BLE error reading sensor 0x%02x: %s",
-                                idx, sensor_count, sensor_id, err
-                            )
+                            else:
+                                _LOGGER.error(
+                                    "[REQ] [%d/%d] ✗ BLE error reading sensor 0x%02x: %s",
+                                    idx, sensor_count, sensor_id, err
+                                )
                             results[sensor_id] = None
                             # Clean up on error
                             request_key = (seq_id, sensor_id)
@@ -878,14 +890,15 @@ class EM1003Device:
                                 break
                         except Exception as err:
                             if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                                _LOGGER.warning(
-                                    "[TRACK-%s] Step X: ✗ EXCEPTION - %s. Request was: seq=%02x, sensor=0x%02x",
-                                    sensor_name, err, seq_id, sensor_id
+                                _LOGGER.error(
+                                    "[%s] ✗ Error: %s",
+                                    sensor_name, err
                                 )
-                            _LOGGER.error(
-                                "[REQ] [%d/%d] ✗ Error reading sensor 0x%02x: %s",
-                                idx, sensor_count, sensor_id, err
-                            )
+                            else:
+                                _LOGGER.error(
+                                    "[REQ] [%d/%d] ✗ Error reading sensor 0x%02x: %s",
+                                    idx, sensor_count, sensor_id, err
+                                )
                             results[sensor_id] = None
                             # Clean up on error
                             request_key = (seq_id, sensor_id)
@@ -904,17 +917,6 @@ class EM1003Device:
                         _LOGGER.debug("[DIAG] Connection already lost, skipping notification stop")
 
                     success_count = sum(1 for v in results.values() if v is not None)
-
-                    # Log final status of problematic sensors
-                    for sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                        sensor_info = SENSOR_TYPES.get(sensor_id, {})
-                        sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
-                        value = results.get(sensor_id)
-                        cached_value = self.sensor_data.get(sensor_id)
-                        _LOGGER.warning(
-                            "[TRACK-%s] FINAL: results[0x%02x]=%s, sensor_data[0x%02x]=%s",
-                            sensor_name, sensor_id, value, sensor_id, cached_value
-                        )
 
                     _LOGGER.info(
                         "[DIAG] Completed reading all sensors. Success: %d/%d",
@@ -1076,7 +1078,8 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 device,
                 mac_address,
                 disconnected_callback=lambda _: None,
-                max_attempts=5,  # Increased retry attempts
+                max_attempts=3,  # Reduced to avoid overwhelming Bluetooth stack
+                timeout=30.0,
             )
 
             try:
@@ -1145,7 +1148,8 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 device,
                 mac_address,
                 disconnected_callback=lambda _: None,
-                max_attempts=5,  # Increased retry attempts
+                max_attempts=3,  # Reduced to avoid overwhelming Bluetooth stack
+                timeout=30.0,
             )
 
             try:
@@ -1185,7 +1189,8 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 device,
                 mac_address,
                 disconnected_callback=lambda _: None,
-                max_attempts=5,  # Increased retry attempts
+                max_attempts=3,  # Reduced to avoid overwhelming Bluetooth stack
+                timeout=30.0,
             )
 
             try:
@@ -1245,7 +1250,8 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 device,
                 mac_address,
                 disconnected_callback=lambda _: None,
-                max_attempts=5,  # Increased retry attempts
+                max_attempts=3,  # Reduced to avoid overwhelming Bluetooth stack
+                timeout=30.0,
             )
 
             try:

@@ -105,16 +105,15 @@ class EM1003DataUpdateCoordinator(DataUpdateCoordinator):
             data = await self.em1003_device.read_all_sensors()
             _LOGGER.debug("Sensor data updated: %s", data)
 
-            # Log problematic sensors specifically
-            for sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                from .const import SENSOR_TYPES
-                sensor_info = SENSOR_TYPES.get(sensor_id, {})
-                sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
-                value = data.get(sensor_id) if data else None
-                _LOGGER.warning(
-                    "[TRACK-%s] COORDINATOR._async_update_data - data[0x%02x] = %s",
-                    sensor_name, sensor_id, value
-                )
+            # Log if problematic sensors have no data
+            if data:
+                for sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
+                    value = data.get(sensor_id)
+                    if value is None:
+                        from .const import SENSOR_TYPES
+                        sensor_info = SENSOR_TYPES.get(sensor_id, {})
+                        sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
+                        _LOGGER.info("[%s] No data received", sensor_name)
 
             return data
         except Exception as err:
@@ -233,39 +232,15 @@ class EM1003Sensor(CoordinatorEntity, SensorEntity):
     @property
     def native_value(self) -> float | None:
         """Return the state of the sensor."""
-        # Special tracking for problematic sensors
-        if self._sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-            _LOGGER.warning(
-                "[TRACK-%s] SENSOR.native_value called - coordinator.data=%s, coordinator.last_update_success=%s",
-                self._sensor_info["name"],
-                self.coordinator.data,
-                self.coordinator.last_update_success
-            )
-
         # Get current value from coordinator
         current_value = None
         if self.coordinator.data is not None:
             current_value = self.coordinator.data.get(self._sensor_id)
 
-            if self._sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                _LOGGER.warning(
-                    "[TRACK-%s] SENSOR.native_value - extracted from coordinator: coordinator.data.get(0x%02x) = %s",
-                    self._sensor_info["name"],
-                    self._sensor_id,
-                    current_value
-                )
-
         # If we have a valid new value, update cache
         if current_value is not None:
             self._last_valid_value = current_value
             self._last_update_time = datetime.now()
-
-            if self._sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                _LOGGER.warning(
-                    "[TRACK-%s] SENSOR.native_value - ✓ Fresh value found, returning %s",
-                    self._sensor_info["name"],
-                    current_value
-                )
 
             _LOGGER.debug(
                 "[VALUE] %s (0x%02x): Fresh value = %s",
@@ -281,14 +256,6 @@ class EM1003Sensor(CoordinatorEntity, SensorEntity):
 
             # If less than 20 minutes, return cached value
             if time_since_update < self._stale_threshold:
-                if self._sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                    _LOGGER.warning(
-                        "[TRACK-%s] SENSOR.native_value - Using cached value %s (age: %d seconds)",
-                        self._sensor_info["name"],
-                        self._last_valid_value,
-                        int(time_since_update.total_seconds())
-                    )
-
                 _LOGGER.debug(
                     "[VALUE] %s (0x%02x): Using cached value %s (age: %d seconds)",
                     self._sensor_info["name"],
@@ -299,13 +266,6 @@ class EM1003Sensor(CoordinatorEntity, SensorEntity):
                 return self._last_valid_value
             else:
                 # Data is too old, mark as unavailable
-                if self._sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                    _LOGGER.warning(
-                        "[TRACK-%s] SENSOR.native_value - ✗ Data stale for %d minutes, returning None",
-                        self._sensor_info["name"],
-                        int(time_since_update.total_seconds() / 60)
-                    )
-
                 _LOGGER.warning(
                     "[VALUE] %s (0x%02x): Data stale for %d minutes, returning None",
                     self._sensor_info["name"],
@@ -314,14 +274,6 @@ class EM1003Sensor(CoordinatorEntity, SensorEntity):
                 )
 
         # No valid data available
-        if self._sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-            _LOGGER.warning(
-                "[TRACK-%s] SENSOR.native_value - ✗ No data available (coordinator_data=%s, cached=%s), returning None",
-                self._sensor_info["name"],
-                self.coordinator.data is not None,
-                self._last_valid_value is not None
-            )
-
         _LOGGER.debug(
             "[VALUE] %s (0x%02x): No data available (coordinator_data=%s, cached=%s)",
             self._sensor_info["name"],
