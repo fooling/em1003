@@ -313,12 +313,6 @@ class EM1003Device:
         if self._last_connection_abort_time is not None:
             time_since_abort = current_time - self._last_connection_abort_time
             if time_since_abort > 300:  # 5 minutes
-                if self._connection_abort_count > 0:
-                    _LOGGER.info(
-                        "[BACKOFF] Resetting connection abort count (%d) after %.0f seconds of stability",
-                        self._connection_abort_count,
-                        time_since_abort
-                    )
                 self._connection_abort_count = 0
                 self._last_connection_abort_time = None
 
@@ -330,11 +324,6 @@ class EM1003Device:
         abort_backoff = 0.0
         if self._connection_abort_count > 0:
             abort_backoff = min(2.0 ** self._connection_abort_count, 30.0)
-            _LOGGER.info(
-                "[BACKOFF] Adding %.1fs backoff for %d recent connection abort(s)",
-                abort_backoff,
-                self._connection_abort_count
-            )
 
         min_delay = base_delay + abort_backoff
 
@@ -343,23 +332,12 @@ class EM1003Device:
             time_since_disconnect = current_time - self._last_disconnect_time
             if time_since_disconnect < min_delay:
                 delay = min_delay - time_since_disconnect
-                _LOGGER.info(
-                    "[BACKOFF] Waiting %.2fs before reconnecting (base=%.1fs + abort_backoff=%.1fs, "
-                    "time_since_disconnect=%.2fs)",
-                    delay, base_delay, abort_backoff, time_since_disconnect
-                )
+                if abort_backoff > 0:
+                    _LOGGER.info("Waiting %.1fs before retry (connection abort backoff)", delay)
                 await asyncio.sleep(delay)
-            else:
-                _LOGGER.debug(
-                    "[BACKOFF] No wait needed, %.2fs elapsed since disconnect (min_delay=%.2fs)",
-                    time_since_disconnect, min_delay
-                )
         elif abort_backoff > 0:
             # No recent disconnect but we have abort history, add safety delay
-            _LOGGER.info(
-                "[BACKOFF] Adding %.2fs safety delay due to %d recent connection abort(s)",
-                abort_backoff, self._connection_abort_count
-            )
+            _LOGGER.info("Waiting %.1fs before retry (connection abort backoff)", abort_backoff)
             await asyncio.sleep(abort_backoff)
 
     async def _establish_connection(self) -> BleakClient:
@@ -497,10 +475,6 @@ class EM1003Device:
 
             # Reset connection abort tracking on successful connection
             if self._connection_abort_count > 0:
-                _LOGGER.info(
-                    "[BACKOFF] Connection successful, resetting abort count from %d to 0",
-                    self._connection_abort_count
-                )
                 self._connection_abort_count = 0
                 self._last_connection_abort_time = None
 
@@ -518,14 +492,8 @@ class EM1003Device:
                 self._connection_abort_count += 1
                 self._last_connection_abort_time = time.time()
                 _LOGGER.warning(
-                    "[DIAG] ✗ Connection abort error #%d for %s: %s",
-                    self._connection_abort_count,
-                    self.mac_address,
-                    conn_err
-                )
-                _LOGGER.info(
-                    "[BACKOFF] Next connection attempt will wait an additional %.1fs",
-                    min(2.0 ** self._connection_abort_count, 30.0)
+                    "[DIAG] ✗ Connection abort for %s (will use backoff on retry)",
+                    self.mac_address
                 )
             else:
                 _LOGGER.error(
