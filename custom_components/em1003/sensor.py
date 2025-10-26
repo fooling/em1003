@@ -103,7 +103,16 @@ class EM1003DataUpdateCoordinator(DataUpdateCoordinator):
         try:
             _LOGGER.debug("Updating sensor data for %s", self.mac_address)
             data = await self.em1003_device.read_all_sensors()
-            _LOGGER.debug("Sensor data updated: %s", data)
+
+            # Check if we actually received any valid data
+            valid_count = sum(1 for v in data.values() if v is not None)
+            if valid_count == 0:
+                raise UpdateFailed(
+                    f"Failed to read any sensor data from {self.mac_address} - "
+                    "connection or device issue"
+                )
+
+            _LOGGER.debug("Sensor data updated: %s (valid: %d/%d)", data, valid_count, len(data))
 
             # Log if problematic sensors have no data
             if data:
