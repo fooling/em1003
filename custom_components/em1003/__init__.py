@@ -463,31 +463,44 @@ class EM1003Device:
             # Value is in little-endian format (e.g., 0x31 0x00 = 49)
             if len(value_bytes) >= 2:
                 raw_value = int.from_bytes(value_bytes[:2], byteorder='little')
+
+                # Get sensor name for better logging
+                sensor_info = SENSOR_TYPES.get(sensor_id, {})
+                sensor_name = sensor_info.get("name", f"Unknown(0x{sensor_id:02x})")
+
                 _LOGGER.debug(
-                    "[RESP] Sensor 0x%02x raw value: %d (0x%s)",
-                    sensor_id, raw_value, value_bytes[:2].hex()
+                    "[RESP] Sensor %s (0x%02x) raw value: %d (bytes: %s)",
+                    sensor_name, sensor_id, raw_value, value_bytes[:2].hex()
                 )
 
                 # Apply sensor-specific scaling and offsets
                 if sensor_id == 0x01:
                     # Temperature: (raw - 4000) / 100
                     self.sensor_data[sensor_id] = (raw_value - 4000) / 100.0
+                    _LOGGER.debug("[RESP] Temperature formula: (%d - 4000) / 100 = %.2f°C", raw_value, self.sensor_data[sensor_id])
                 elif sensor_id == 0x06:
                     # Humidity: raw / 100
                     self.sensor_data[sensor_id] = raw_value / 100.0
+                    _LOGGER.debug("[RESP] Humidity formula: %d / 100 = %.2f%%", raw_value, self.sensor_data[sensor_id])
                 elif sensor_id == 0x0A:
                     # Formaldehyde: (raw - 16384) / 1000
                     self.sensor_data[sensor_id] = (raw_value - 16384) / 1000.0
+                    _LOGGER.debug("[RESP] Formaldehyde formula: (%d - 16384) / 1000 = %.3f mg/m³", raw_value, self.sensor_data[sensor_id])
                 elif sensor_id == 0x12:
                     # TVOC: raw × 0.001
                     self.sensor_data[sensor_id] = raw_value * 0.001
+                    _LOGGER.debug("[RESP] TVOC formula: %d × 0.001 = %.3f mg/m³", raw_value, self.sensor_data[sensor_id])
                 else:
-                    # Other sensors use raw value directly
+                    # Other sensors use raw value directly (PM2.5, PM10, Noise, eCO2)
                     self.sensor_data[sensor_id] = raw_value
+                    _LOGGER.debug("[RESP] %s: raw value %d (no conversion)", sensor_name, raw_value)
 
-                _LOGGER.debug(
-                    "[RESP] Sensor 0x%02x parsed value: %s",
-                    sensor_id, self.sensor_data.get(sensor_id)
+                _LOGGER.info(
+                    "[RESP] ✓ %s (0x%02x) = %s %s",
+                    sensor_name,
+                    sensor_id,
+                    self.sensor_data.get(sensor_id),
+                    sensor_info.get("unit", "")
                 )
 
             # Complete the future and remove from pending requests
