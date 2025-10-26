@@ -611,10 +611,8 @@ class EM1003Device:
         This prevents accepting wrong responses due to timing issues.
         """
         try:
-            _LOGGER.debug("Received notification from %s: %s", self.mac_address, data.hex())
-
             if len(data) < 3:
-                _LOGGER.warning("Notification too short: %d bytes", len(data))
+                _LOGGER.warning("[RX] Notification too short: %d bytes, raw: %s", len(data), data.hex())
                 return
 
             seq_id = data[0]
@@ -622,96 +620,72 @@ class EM1003Device:
             sensor_id = data[2]
             value_bytes = data[3:]
 
+            # Get sensor name for logging
+            sensor_info = SENSOR_TYPES.get(sensor_id, {})
+            sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
+
+            _LOGGER.debug(
+                "[RX] %s ← Raw: %s | Parsed: seq_id=0x%02x, cmd=0x%02x, sensor_id=0x%02x, value_bytes=%s",
+                sensor_name, data.hex(), seq_id, cmd_type, sensor_id, value_bytes.hex()
+            )
+
 
             # Find matching pending request using (seq_id, sensor_id) key
             request_key = (seq_id, sensor_id)
             pending_request = self._pending_requests.get(request_key)
 
             if not pending_request:
-                if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                    sensor_info = SENSOR_TYPES.get(sensor_id, {})
-                    sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
-                    _LOGGER.warning(
-                        "[%s] Unexpected response: seq=%02x, no matching request",
-                        sensor_name, seq_id
-                    )
-                else:
-                    _LOGGER.warning(
-                        "[RESP] ✗ Received unexpected response: seq=%02x, sensor=%02x, value=%s "
-                        "(no matching pending request)",
-                        seq_id, sensor_id, value_bytes.hex()
-                    )
+                _LOGGER.warning(
+                    "[RX] ✗ %s: Unexpected response (seq=0x%02x, no matching request)",
+                    sensor_name, seq_id
+                )
                 return
-
-            _LOGGER.debug(
-                "[RESP] ✓ Matched response: seq=%02x, cmd=%02x, sensor=%02x, value=%s",
-                seq_id, cmd_type, sensor_id, value_bytes.hex()
-            )
 
             # Parse value based on sensor type
             # Value is in little-endian format (e.g., 0x31 0x00 = 49)
             if len(value_bytes) >= 2:
                 raw_value = int.from_bytes(value_bytes[:2], byteorder='little')
 
-                # Get sensor name for better logging
-                sensor_info = SENSOR_TYPES.get(sensor_id, {})
-                sensor_name = sensor_info.get("name", f"Unknown(0x{sensor_id:02x})")
-
-
-                _LOGGER.debug(
-                    "[RESP] Sensor %s (0x%02x) raw value: %d (bytes: %s)",
-                    sensor_name, sensor_id, raw_value, value_bytes[:2].hex()
-                )
-
                 # Apply sensor-specific scaling and offsets
+                formula_desc = ""
                 if sensor_id == 0x01:
                     # Temperature: (raw - 4000) / 100
                     self.sensor_data[sensor_id] = (raw_value - 4000) / 100.0
-                    _LOGGER.debug("[RESP] Temperature formula: (%d - 4000) / 100 = %.2f°C", raw_value, self.sensor_data[sensor_id])
+                    formula_desc = f"({raw_value} - 4000) / 100"
                 elif sensor_id == 0x06:
                     # Humidity: raw / 100
                     self.sensor_data[sensor_id] = raw_value / 100.0
-                    _LOGGER.debug("[RESP] Humidity formula: %d / 100 = %.2f%%", raw_value, self.sensor_data[sensor_id])
+                    formula_desc = f"{raw_value} / 100"
                 elif sensor_id == 0x0A:
                     # Formaldehyde: (raw - 16384) / 1000
                     self.sensor_data[sensor_id] = (raw_value - 16384) / 1000.0
-                    _LOGGER.debug("[RESP] Formaldehyde formula: (%d - 16384) / 1000 = %.3f mg/m³", raw_value, self.sensor_data[sensor_id])
-                elif sensor_id == 0x11:
-                    # PM10: raw value directly
+                    formula_desc = f"({raw_value} - 16384) / 1000"
+                elif sensor_id in [0x02, 0x11, 0x12, 0x13]:
+                    # PM2.5, PM10, TVOC, eCO2: raw value directly
                     self.sensor_data[sensor_id] = raw_value
-                    if sensor_id in [0x11, 0x12, 0x13]:
-                        _LOGGER.debug("[%s] Parsed: raw=%d → value=%d", sensor_name, raw_value, self.sensor_data[sensor_id])
-                elif sensor_id == 0x12:
-                    # TVOC: raw value is directly in µg/m³
-                    # Device returns: raw * 0.001 mg/m³, which equals raw * 0.001 * 1000 = raw µg/m³
-                    self.sensor_data[sensor_id] = raw_value
-                    if sensor_id in [0x11, 0x12, 0x13]:
-                        _LOGGER.debug("[%s] Parsed: raw=%d → value=%d", sensor_name, raw_value, self.sensor_data[sensor_id])
-                elif sensor_id == 0x13:
-                    # eCO2: raw value directly
-                    self.sensor_data[sensor_id] = raw_value
-                    if sensor_id in [0x11, 0x12, 0x13]:
-                        _LOGGER.debug("[%s] Parsed: raw=%d → value=%d", sensor_name, raw_value, self.sensor_data[sensor_id])
+                    formula_desc = f"{raw_value} (direct)"
                 else:
-                    # Other sensors use raw value directly (PM2.5, Noise)
+                    # Other sensors use raw value directly (Noise, etc.)
                     self.sensor_data[sensor_id] = raw_value
-                    _LOGGER.debug("[RESP] %s: raw value %d (no conversion)", sensor_name, raw_value)
+                    formula_desc = f"{raw_value} (direct)"
+
+                unit = sensor_info.get("unit", "")
+                final_value = self.sensor_data.get(sensor_id)
+
+                _LOGGER.debug(
+                    "[RX] %s: value_bytes=%s → raw=%d → formula=[%s] → final=%s %s",
+                    sensor_name, value_bytes[:2].hex(), raw_value, formula_desc, final_value, unit
+                )
 
                 _LOGGER.info(
                     "[RESP] ✓ %s (0x%02x) = %s %s",
-                    sensor_name,
-                    sensor_id,
-                    self.sensor_data.get(sensor_id),
-                    sensor_info.get("unit", "")
+                    sensor_name, sensor_id, final_value, unit
                 )
             else:
-                if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                    sensor_info = SENSOR_TYPES.get(sensor_id, {})
-                    sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
-                    _LOGGER.warning(
-                        "[%s] ✗ Value too short: got %d bytes, need at least 2",
-                        sensor_name, len(value_bytes)
-                    )
+                _LOGGER.warning(
+                    "[RX] ✗ %s: Value too short (got %d bytes, need at least 2)",
+                    sensor_name, len(value_bytes)
+                )
 
             # Complete the future and remove from pending requests
             if not pending_request.future.done():
@@ -758,8 +732,8 @@ class EM1003Device:
             request = bytes([seq_id, CMD_READ_SENSOR, sensor_id])
 
             _LOGGER.debug(
-                "Sending request to sensor 0x%02x: seq=%02x, data=%s",
-                sensor_id, seq_id, request.hex()
+                "[TX] Sending request → Raw: %s | Parsed: seq_id=0x%02x, cmd=0x%02x(READ), sensor_id=0x%02x",
+                request.hex(), seq_id, CMD_READ_SENSOR, sensor_id
             )
 
             # Create pending request and add to cache
@@ -884,8 +858,8 @@ class EM1003Device:
                         )
 
                     _LOGGER.debug(
-                        "[REQ] [%d/%d] Sending request: seq=%02x, sensor=0x%02x, data=%s",
-                        idx, sensor_count, seq_id, sensor_id, request.hex()
+                        "[TX] [%d/%d] %s → Raw: %s | Parsed: seq_id=0x%02x, cmd=0x%02x(READ), sensor_id=0x%02x",
+                        idx, sensor_count, sensor_name, request.hex(), seq_id, CMD_READ_SENSOR, sensor_id
                     )
 
                     # Create pending request and add to cache
