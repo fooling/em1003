@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
@@ -98,11 +99,56 @@ class EM1003Device:
         self._notify_future: asyncio.Future | None = None
         self._sequence_id = 0xA0  # Start sequence ID
         self.sensor_data: dict[int, float | None] = {}
+        self._connection_lock = asyncio.Lock()  # Prevent concurrent connections
+        self._last_disconnect_time: float | None = None
 
     def _get_next_sequence_id(self) -> int:
         """Get next sequence ID for requests."""
         self._sequence_id = (self._sequence_id + 1) % 0x100
         return self._sequence_id
+
+    async def _ensure_connection_delay(self) -> None:
+        """Ensure sufficient delay since last disconnect to avoid connection issues."""
+        if self._last_disconnect_time is not None:
+            time_since_disconnect = time.time() - self._last_disconnect_time
+            min_delay = 1.0  # Minimum 1 second between connection attempts
+            if time_since_disconnect < min_delay:
+                delay = min_delay - time_since_disconnect
+                _LOGGER.debug("Waiting %.2f seconds before reconnecting to %s", delay, self.mac_address)
+                await asyncio.sleep(delay)
+
+    async def _establish_connection(self) -> BleakClient:
+        """Establish a connection to the device with proper error handling.
+
+        Returns:
+            Connected BleakClient instance
+
+        Raises:
+            BleakError: If connection fails after retries
+        """
+        # Wait if we recently disconnected to avoid connection abort errors
+        await self._ensure_connection_delay()
+
+        # Get a fresh device reference to ensure we have the latest advertising data
+        device = bluetooth.async_ble_device_from_address(
+            self.hass, self.mac_address, connectable=True
+        )
+
+        if not device:
+            raise BleakError(f"Device not found: {self.mac_address}")
+
+        # Establish connection with timeout and retry logic
+        # Use a longer timeout and more attempts to handle flaky connections
+        client = await establish_connection(
+            BleakClient,
+            device,
+            self.mac_address,
+            disconnected_callback=lambda _: None,
+            max_attempts=5,
+            timeout=30.0,  # 30 second timeout per attempt
+        )
+
+        return client
 
     def _notification_handler(self, sender, data: bytearray) -> None:
         """Handle notification from device."""
@@ -163,66 +209,56 @@ class EM1003Device:
         Returns:
             Sensor value or None if reading fails
         """
-        try:
-            device = bluetooth.async_ble_device_from_address(
-                self.hass, self.mac_address, connectable=True
-            )
-
-            if not device:
-                _LOGGER.error("Device not found: %s", self.mac_address)
-                return None
-
-            client = await establish_connection(
-                BleakClient,
-                device,
-                self.mac_address,
-                disconnected_callback=lambda _: None,
-                max_attempts=5,  # Increased retry attempts
-            )
-
+        # Use lock to prevent concurrent connection attempts
+        async with self._connection_lock:
             try:
-                _LOGGER.debug("Connected to device %s", self.mac_address)
+                # Establish connection with improved error handling
+                client = await self._establish_connection()
 
-                # Subscribe to notifications
-                await client.start_notify(EM1003_NOTIFY_CHAR_UUID, self._notification_handler)
-                _LOGGER.debug("Subscribed to notifications")
-
-                # Prepare request
-                seq_id = self._get_next_sequence_id()
-                request = bytes([seq_id, CMD_READ_SENSOR, sensor_id])
-
-                _LOGGER.info(
-                    "Sending request to sensor %02x: %s",
-                    sensor_id, request.hex()
-                )
-
-                # Create future for response
-                self._notify_future = asyncio.Future()
-
-                # Send request
-                await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
-
-                # Wait for response with timeout
                 try:
-                    await asyncio.wait_for(self._notify_future, timeout=5.0)
-                except asyncio.TimeoutError:
-                    _LOGGER.warning("Timeout waiting for sensor %02x response", sensor_id)
-                    return None
+                    _LOGGER.debug("Connected to device %s", self.mac_address)
 
-                # Stop notifications
-                await client.stop_notify(EM1003_NOTIFY_CHAR_UUID)
+                    # Subscribe to notifications
+                    await client.start_notify(EM1003_NOTIFY_CHAR_UUID, self._notification_handler)
+                    _LOGGER.debug("Subscribed to notifications")
 
-                # Return parsed value
-                return self.sensor_data.get(sensor_id)
-            finally:
-                await client.disconnect()
+                    # Prepare request
+                    seq_id = self._get_next_sequence_id()
+                    request = bytes([seq_id, CMD_READ_SENSOR, sensor_id])
 
-        except BleakError as err:
-            _LOGGER.error("Bleak error reading sensor %02x: %s", sensor_id, err)
-            return None
-        except Exception as err:
-            _LOGGER.error("Error reading sensor %02x: %s", sensor_id, err, exc_info=True)
-            return None
+                    _LOGGER.info(
+                        "Sending request to sensor %02x: %s",
+                        sensor_id, request.hex()
+                    )
+
+                    # Create future for response
+                    self._notify_future = asyncio.Future()
+
+                    # Send request
+                    await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
+
+                    # Wait for response with timeout
+                    try:
+                        await asyncio.wait_for(self._notify_future, timeout=5.0)
+                    except asyncio.TimeoutError:
+                        _LOGGER.warning("Timeout waiting for sensor %02x response", sensor_id)
+                        return None
+
+                    # Stop notifications
+                    await client.stop_notify(EM1003_NOTIFY_CHAR_UUID)
+
+                    # Return parsed value
+                    return self.sensor_data.get(sensor_id)
+                finally:
+                    await client.disconnect()
+                    self._last_disconnect_time = time.time()
+
+            except BleakError as err:
+                _LOGGER.error("Bleak error reading sensor %02x: %s", sensor_id, err)
+                return None
+            except Exception as err:
+                _LOGGER.error("Error reading sensor %02x: %s", sensor_id, err, exc_info=True)
+                return None
 
     async def read_all_sensors(self) -> dict[int, float | None]:
         """Read all sensors and return their values.
@@ -232,76 +268,65 @@ class EM1003Device:
         """
         results = {}
 
-        try:
-            device = bluetooth.async_ble_device_from_address(
-                self.hass, self.mac_address, connectable=True
-            )
-
-            if not device:
-                _LOGGER.error("Device not found: %s", self.mac_address)
-                return results
-
-            # Establish connection once for all sensors
-            client = await establish_connection(
-                BleakClient,
-                device,
-                self.mac_address,
-                disconnected_callback=lambda _: None,
-                max_attempts=5,  # Increased retry attempts
-            )
-
+        # Use lock to prevent concurrent connection attempts
+        async with self._connection_lock:
             try:
-                _LOGGER.debug("Connected to device %s for reading all sensors", self.mac_address)
+                # Establish connection with improved error handling
+                client = await self._establish_connection()
 
-                # Subscribe to notifications once
-                await client.start_notify(EM1003_NOTIFY_CHAR_UUID, self._notification_handler)
-                _LOGGER.debug("Subscribed to notifications")
+                try:
+                    _LOGGER.debug("Connected to device %s for reading all sensors", self.mac_address)
 
-                # Read all sensors using the same connection
-                for sensor_id in SENSOR_TYPES.keys():
-                    try:
-                        # Prepare request
-                        seq_id = self._get_next_sequence_id()
-                        request = bytes([seq_id, CMD_READ_SENSOR, sensor_id])
+                    # Subscribe to notifications once
+                    await client.start_notify(EM1003_NOTIFY_CHAR_UUID, self._notification_handler)
+                    _LOGGER.debug("Subscribed to notifications")
 
-                        _LOGGER.debug(
-                            "Sending request to sensor %02x: %s",
-                            sensor_id, request.hex()
-                        )
-
-                        # Create future for response
-                        self._notify_future = asyncio.Future()
-
-                        # Send request
-                        await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
-
-                        # Wait for response with timeout
+                    # Read all sensors using the same connection
+                    for sensor_id in SENSOR_TYPES.keys():
                         try:
-                            await asyncio.wait_for(self._notify_future, timeout=5.0)
-                            # Get parsed value
-                            results[sensor_id] = self.sensor_data.get(sensor_id)
-                        except asyncio.TimeoutError:
-                            _LOGGER.warning("Timeout waiting for sensor %02x response", sensor_id)
+                            # Prepare request
+                            seq_id = self._get_next_sequence_id()
+                            request = bytes([seq_id, CMD_READ_SENSOR, sensor_id])
+
+                            _LOGGER.debug(
+                                "Sending request to sensor %02x: %s",
+                                sensor_id, request.hex()
+                            )
+
+                            # Create future for response
+                            self._notify_future = asyncio.Future()
+
+                            # Send request
+                            await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
+
+                            # Wait for response with timeout
+                            try:
+                                await asyncio.wait_for(self._notify_future, timeout=5.0)
+                                # Get parsed value
+                                results[sensor_id] = self.sensor_data.get(sensor_id)
+                            except asyncio.TimeoutError:
+                                _LOGGER.warning("Timeout waiting for sensor %02x response", sensor_id)
+                                results[sensor_id] = None
+
+                            # Small delay between sensor reads
+                            await asyncio.sleep(0.3)
+
+                        except Exception as err:
+                            _LOGGER.error("Error reading sensor %02x: %s", sensor_id, err)
                             results[sensor_id] = None
 
-                        # Small delay between sensor reads
-                        await asyncio.sleep(0.3)
+                    # Stop notifications
+                    await client.stop_notify(EM1003_NOTIFY_CHAR_UUID)
 
-                    except Exception as err:
-                        _LOGGER.error("Error reading sensor %02x: %s", sensor_id, err)
-                        results[sensor_id] = None
+                finally:
+                    await client.disconnect()
+                    self._last_disconnect_time = time.time()
+                    _LOGGER.debug("Disconnected from device %s", self.mac_address)
 
-                # Stop notifications
-                await client.stop_notify(EM1003_NOTIFY_CHAR_UUID)
-
-            finally:
-                await client.disconnect()
-                _LOGGER.debug("Disconnected from device %s", self.mac_address)
-
-        except BleakError as err:
-            _LOGGER.error("Bleak error reading all sensors: %s", err)
-        except Exception as err:
-            _LOGGER.error("Error reading all sensors: %s", err, exc_info=True)
+            except BleakError as err:
+                _LOGGER.error("Bleak error reading all sensors: %s - %s", self.mac_address, err)
+            except Exception as err:
+                _LOGGER.error("Error reading all sensors: %s", err, exc_info=True)
 
         return results
 
