@@ -522,14 +522,6 @@ class EM1003Device:
             sensor_id = data[2]
             value_bytes = data[3:]
 
-            # Special logging for problematic sensors
-            if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                sensor_info = SENSOR_TYPES.get(sensor_id, {})
-                sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
-                _LOGGER.warning(
-                    "[TRACK-%s] Step 1: Notification received - seq=%02x, cmd=%02x, raw_data=%s, value_bytes=%s",
-                    sensor_name, seq_id, cmd_type, data.hex(), value_bytes.hex()
-                )
 
             # Find matching pending request using (seq_id, sensor_id) key
             request_key = (seq_id, sensor_id)
@@ -540,26 +532,16 @@ class EM1003Device:
                     sensor_info = SENSOR_TYPES.get(sensor_id, {})
                     sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
                     _LOGGER.warning(
-                        "[TRACK-%s] Step 2: ✗ NO MATCHING REQUEST FOUND - seq=%02x, sensor=%02x, value=%s. "
-                        "Current pending requests: %s",
-                        sensor_name, seq_id, sensor_id, value_bytes.hex(),
-                        {f"(seq={k[0]:02x},sensor={k[1]:02x})": f"age={time.time()-v.timestamp:.1f}s"
-                         for k, v in self._pending_requests.items()}
+                        "[%s] Unexpected response: seq=%02x, no matching request",
+                        sensor_name, seq_id
                     )
-                _LOGGER.warning(
-                    "[RESP] ✗ Received unexpected response: seq=%02x, sensor=%02x, value=%s "
-                    "(no matching pending request)",
-                    seq_id, sensor_id, value_bytes.hex()
-                )
+                else:
+                    _LOGGER.warning(
+                        "[RESP] ✗ Received unexpected response: seq=%02x, sensor=%02x, value=%s "
+                        "(no matching pending request)",
+                        seq_id, sensor_id, value_bytes.hex()
+                    )
                 return
-
-            if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                sensor_info = SENSOR_TYPES.get(sensor_id, {})
-                sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
-                _LOGGER.warning(
-                    "[TRACK-%s] Step 2: ✓ Matched pending request - seq=%02x, request_age=%.2fs",
-                    sensor_name, seq_id, time.time() - pending_request.timestamp
-                )
 
             _LOGGER.debug(
                 "[RESP] ✓ Matched response: seq=%02x, cmd=%02x, sensor=%02x, value=%s",
@@ -575,15 +557,6 @@ class EM1003Device:
                 sensor_info = SENSOR_TYPES.get(sensor_id, {})
                 sensor_name = sensor_info.get("name", f"Unknown(0x{sensor_id:02x})")
 
-                if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                    _LOGGER.warning(
-                        "[TRACK-%s] Step 3: Parsing value - value_bytes=%s, length=%d",
-                        sensor_name, value_bytes.hex(), len(value_bytes)
-                    )
-                    _LOGGER.warning(
-                        "[TRACK-%s] Step 3: Raw value parsed - byte0=0x%02x, byte1=0x%02x, raw_value=%d",
-                        sensor_name, value_bytes[0], value_bytes[1] if len(value_bytes) > 1 else 0, raw_value
-                    )
 
                 _LOGGER.debug(
                     "[RESP] Sensor %s (0x%02x) raw value: %d (bytes: %s)",
@@ -606,29 +579,23 @@ class EM1003Device:
                 elif sensor_id == 0x11:
                     # PM10: raw value directly
                     self.sensor_data[sensor_id] = raw_value
-                    _LOGGER.warning("[TRACK-PM10] Step 4: Conversion applied - raw_value=%d, final_value=%d µg/m³",
-                                  raw_value, self.sensor_data[sensor_id])
+                    if sensor_id in [0x11, 0x12, 0x13]:
+                        _LOGGER.debug("[%s] Parsed: raw=%d → value=%d", sensor_name, raw_value, self.sensor_data[sensor_id])
                 elif sensor_id == 0x12:
                     # TVOC: raw value is directly in µg/m³
                     # Device returns: raw * 0.001 mg/m³, which equals raw * 0.001 * 1000 = raw µg/m³
                     self.sensor_data[sensor_id] = raw_value
-                    _LOGGER.warning("[TRACK-TVOC] Step 4: Conversion applied - raw_value=%d, final_value=%d µg/m³",
-                                  raw_value, self.sensor_data[sensor_id])
+                    if sensor_id in [0x11, 0x12, 0x13]:
+                        _LOGGER.debug("[%s] Parsed: raw=%d → value=%d", sensor_name, raw_value, self.sensor_data[sensor_id])
                 elif sensor_id == 0x13:
                     # eCO2: raw value directly
                     self.sensor_data[sensor_id] = raw_value
-                    _LOGGER.warning("[TRACK-eCO2] Step 4: Conversion applied - raw_value=%d, final_value=%d ppm",
-                                  raw_value, self.sensor_data[sensor_id])
+                    if sensor_id in [0x11, 0x12, 0x13]:
+                        _LOGGER.debug("[%s] Parsed: raw=%d → value=%d", sensor_name, raw_value, self.sensor_data[sensor_id])
                 else:
                     # Other sensors use raw value directly (PM2.5, Noise)
                     self.sensor_data[sensor_id] = raw_value
                     _LOGGER.debug("[RESP] %s: raw value %d (no conversion)", sensor_name, raw_value)
-
-                if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                    _LOGGER.warning(
-                        "[TRACK-%s] Step 5: Stored in sensor_data - sensor_data[0x%02x] = %s",
-                        sensor_name, sensor_id, self.sensor_data.get(sensor_id)
-                    )
 
                 _LOGGER.info(
                     "[RESP] ✓ %s (0x%02x) = %s %s",
@@ -642,8 +609,8 @@ class EM1003Device:
                     sensor_info = SENSOR_TYPES.get(sensor_id, {})
                     sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
                     _LOGGER.warning(
-                        "[TRACK-%s] Step 3: ✗ VALUE TOO SHORT - value_bytes=%s, length=%d (need at least 2)",
-                        sensor_name, value_bytes.hex(), len(value_bytes)
+                        "[%s] ✗ Value too short: got %d bytes, need at least 2",
+                        sensor_name, len(value_bytes)
                     )
 
             # Complete the future and remove from pending requests
@@ -833,9 +800,9 @@ class EM1003Device:
                             sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
 
                             if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                                _LOGGER.warning(
-                                    "[TRACK-%s] Step 0: Preparing request - seq=%02x, sensor=0x%02x, request_data=%s",
-                                    sensor_name, seq_id, sensor_id, request.hex()
+                                _LOGGER.info(
+                                    "[%s] Requesting sensor 0x%02x (seq=%02x)",
+                                    sensor_name, sensor_id, seq_id
                                 )
 
                             _LOGGER.debug(
@@ -853,22 +820,10 @@ class EM1003Device:
                             request_key = (seq_id, sensor_id)
                             self._pending_requests[request_key] = pending_request
 
-                            if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                                _LOGGER.warning(
-                                    "[TRACK-%s] Step 0.5: Pending request created - request_key=(seq=%02x,sensor=%02x), "
-                                    "timestamp=%.2f, total_pending=%d",
-                                    sensor_name, seq_id, sensor_id, pending_request.timestamp,
-                                    len(self._pending_requests)
-                                )
 
                             # Send request
                             await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
 
-                            if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                                _LOGGER.warning(
-                                    "[TRACK-%s] Step 0.8: Request sent to device via write_gatt_char, now waiting for response...",
-                                    sensor_name
-                                )
 
                             # Wait for response with timeout
                             try:
@@ -878,10 +833,9 @@ class EM1003Device:
                                 results[sensor_id] = value
 
                                 if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                                    _LOGGER.warning(
-                                        "[TRACK-%s] Step 6: ✓ Response received and processed - value=%s, "
-                                        "stored in results[0x%02x]",
-                                        sensor_name, value, sensor_id
+                                    _LOGGER.info(
+                                        "[%s] ✓ Got value: %s",
+                                        sensor_name, value
                                     )
 
                                 _LOGGER.debug(
@@ -891,14 +845,14 @@ class EM1003Device:
                             except asyncio.TimeoutError:
                                 if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
                                     _LOGGER.warning(
-                                        "[TRACK-%s] Step X: ✗ TIMEOUT after 5.0s - No response received from device. "
-                                        "Request was: seq=%02x, sensor=0x%02x",
-                                        sensor_name, seq_id, sensor_id
+                                        "[%s] ✗ TIMEOUT (5s) - sensor 0x%02x not responding",
+                                        sensor_name, sensor_id
                                     )
-                                _LOGGER.warning(
-                                    "[REQ] [%d/%d] ✗ Timeout waiting for sensor 0x%02x response (seq=%02x)",
-                                    idx, sensor_count, sensor_id, seq_id
-                                )
+                                else:
+                                    _LOGGER.warning(
+                                        "[REQ] [%d/%d] ✗ Timeout waiting for sensor 0x%02x response (seq=%02x)",
+                                        idx, sensor_count, sensor_id, seq_id
+                                    )
                                 results[sensor_id] = None
                                 # Clean up pending request on timeout
                                 self._pending_requests.pop(request_key, None)
@@ -909,14 +863,15 @@ class EM1003Device:
 
                         except BleakError as err:
                             if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                                _LOGGER.warning(
-                                    "[TRACK-%s] Step X: ✗ BLEAK ERROR - %s. Request was: seq=%02x, sensor=0x%02x",
-                                    sensor_name, err, seq_id, sensor_id
+                                _LOGGER.error(
+                                    "[%s] ✗ BLE error: %s",
+                                    sensor_name, err
                                 )
-                            _LOGGER.error(
-                                "[REQ] [%d/%d] ✗ BLE error reading sensor 0x%02x: %s",
-                                idx, sensor_count, sensor_id, err
-                            )
+                            else:
+                                _LOGGER.error(
+                                    "[REQ] [%d/%d] ✗ BLE error reading sensor 0x%02x: %s",
+                                    idx, sensor_count, sensor_id, err
+                                )
                             results[sensor_id] = None
                             # Clean up on error
                             request_key = (seq_id, sensor_id)
@@ -935,14 +890,15 @@ class EM1003Device:
                                 break
                         except Exception as err:
                             if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                                _LOGGER.warning(
-                                    "[TRACK-%s] Step X: ✗ EXCEPTION - %s. Request was: seq=%02x, sensor=0x%02x",
-                                    sensor_name, err, seq_id, sensor_id
+                                _LOGGER.error(
+                                    "[%s] ✗ Error: %s",
+                                    sensor_name, err
                                 )
-                            _LOGGER.error(
-                                "[REQ] [%d/%d] ✗ Error reading sensor 0x%02x: %s",
-                                idx, sensor_count, sensor_id, err
-                            )
+                            else:
+                                _LOGGER.error(
+                                    "[REQ] [%d/%d] ✗ Error reading sensor 0x%02x: %s",
+                                    idx, sensor_count, sensor_id, err
+                                )
                             results[sensor_id] = None
                             # Clean up on error
                             request_key = (seq_id, sensor_id)
@@ -961,17 +917,6 @@ class EM1003Device:
                         _LOGGER.debug("[DIAG] Connection already lost, skipping notification stop")
 
                     success_count = sum(1 for v in results.values() if v is not None)
-
-                    # Log final status of problematic sensors
-                    for sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                        sensor_info = SENSOR_TYPES.get(sensor_id, {})
-                        sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
-                        value = results.get(sensor_id)
-                        cached_value = self.sensor_data.get(sensor_id)
-                        _LOGGER.warning(
-                            "[TRACK-%s] FINAL: results[0x%02x]=%s, sensor_data[0x%02x]=%s",
-                            sensor_name, sensor_id, value, sensor_id, cached_value
-                        )
 
                     _LOGGER.info(
                         "[DIAG] Completed reading all sensors. Success: %d/%d",
