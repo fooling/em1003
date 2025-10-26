@@ -195,6 +195,31 @@ class EM1003Sensor(CoordinatorEntity, SensorEntity):
         )
 
     @property
+    def available(self) -> bool:
+        """Return if entity is available.
+
+        Consider sensor available if:
+        1. Coordinator has fresh data, OR
+        2. We have cached data that's less than 20 minutes old
+        """
+        # Check if we have fresh data from coordinator
+        if self.coordinator.last_update_success:
+            if self.coordinator.data is not None:
+                current_value = self.coordinator.data.get(self._sensor_id)
+                if current_value is not None:
+                    return True
+
+        # Check if we have recent cached data
+        if self._last_valid_value is not None and self._last_update_time is not None:
+            time_since_update = datetime.now() - self._last_update_time
+            if time_since_update < self._stale_threshold:
+                # Cached data is fresh enough
+                return True
+
+        # No fresh or cached data available
+        return False
+
+    @property
     def native_value(self) -> float | None:
         """Return the state of the sensor."""
         # Get current value from coordinator
@@ -206,6 +231,12 @@ class EM1003Sensor(CoordinatorEntity, SensorEntity):
         if current_value is not None:
             self._last_valid_value = current_value
             self._last_update_time = datetime.now()
+            _LOGGER.debug(
+                "[VALUE] %s (0x%02x): Fresh value = %s",
+                self._sensor_info["name"],
+                self._sensor_id,
+                current_value
+            )
             return current_value
 
         # No new data available, check if we should use cached value
@@ -215,23 +246,30 @@ class EM1003Sensor(CoordinatorEntity, SensorEntity):
             # If less than 20 minutes, return cached value
             if time_since_update < self._stale_threshold:
                 _LOGGER.debug(
-                    "Sensor %s (0x%02x): No new data, using cached value %.3f (age: %s)",
+                    "[VALUE] %s (0x%02x): Using cached value %s (age: %d seconds)",
                     self._sensor_info["name"],
                     self._sensor_id,
                     self._last_valid_value,
-                    time_since_update
+                    int(time_since_update.total_seconds())
                 )
                 return self._last_valid_value
             else:
                 # Data is too old, mark as unavailable
                 _LOGGER.warning(
-                    "Sensor %s (0x%02x): Data stale for %s (>20min), marking unavailable",
+                    "[VALUE] %s (0x%02x): Data stale for %d minutes, returning None",
                     self._sensor_info["name"],
                     self._sensor_id,
-                    time_since_update
+                    int(time_since_update.total_seconds() / 60)
                 )
 
         # No valid data available
+        _LOGGER.debug(
+            "[VALUE] %s (0x%02x): No data available (coordinator_data=%s, cached=%s)",
+            self._sensor_info["name"],
+            self._sensor_id,
+            self.coordinator.data is not None,
+            self._last_valid_value is not None
+        )
         return None
 
     @property
