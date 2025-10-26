@@ -398,20 +398,21 @@ class EM1003Device:
                     )
 
                     # Validate RSSI if available
+                    # Accept device if RSSI is None (may be normal for some scanners)
+                    # Only reject if RSSI is available but too weak
                     if device_rssi is None:
-                        # RSSI not available - device might be stale in cache
-                        _LOGGER.warning(
-                            "[DIAG] ⚠ Device found but RSSI is N/A (stale cache?). "
-                            "Waiting for fresh scan data..."
+                        # RSSI not available - but device was found, so proceed
+                        _LOGGER.info(
+                            "[DIAG] ✓ Device found (RSSI N/A, but proceeding anyway)"
                         )
-                        device = None  # Clear and retry
+                        break  # Accept device even without RSSI
                     elif device_rssi < min_rssi_threshold:
                         _LOGGER.warning(
                             "[DIAG] ⚠ Device signal too weak (RSSI: %s dBm < %s dBm threshold). "
-                            "Device may be out of range.",
+                            "Waiting for better signal...",
                             device_rssi, min_rssi_threshold
                         )
-                        device = None  # Clear and retry
+                        device = None  # Clear and retry for better signal
                     else:
                         # Good signal found!
                         _LOGGER.info(
@@ -1108,7 +1109,21 @@ class EM1003Device:
                 )
                 self._circuit_breaker.record_failure()
 
-            # Connection remains open for next read
+            # CRITICAL: Disconnect immediately after reading to free up connection slot
+            # EM1003 device responds very fast (<2s), no need to keep connection open
+            # This prevents "No backend with an available connection slot" errors
+            if self._client and self._client.is_connected:
+                try:
+                    _LOGGER.info(
+                        "[CONN] Disconnecting after successful read to free connection slot"
+                    )
+                    await self.disconnect()
+                except Exception as disconnect_err:
+                    _LOGGER.debug(
+                        "[CONN] Error during post-read disconnect: %s",
+                        disconnect_err
+                    )
+
             return results
 
         except BleakError as err:
