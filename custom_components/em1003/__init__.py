@@ -16,6 +16,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr
 import voluptuous as vol
 
 from .const import (
@@ -788,6 +789,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Create EM1003 device instance
     em1003_device = EM1003Device(hass, mac_address)
+
+    # Register device in device registry before creating entities
+    device_registry = dr.async_get(hass)
+    device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, mac_address)},
+        name=device_name,
+        manufacturer="EM1003",
+        model="BLE Air Quality Sensor",
+        connections={("mac", mac_address)},
+    )
+    _LOGGER.info("Device registered in device registry: %s", device_name)
 
     # Store device info in hass.data
     hass.data.setdefault(DOMAIN, {})
