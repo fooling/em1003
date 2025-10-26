@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -156,6 +156,11 @@ class EM1003Sensor(CoordinatorEntity, SensorEntity):
         else:  # Other sensors (no decimals)
             self._attr_suggested_display_precision = 0
 
+        # Cache for last valid value and timestamp
+        self._last_valid_value: float | None = None
+        self._last_update_time: datetime | None = None
+        self._stale_threshold = timedelta(minutes=20)
+
     @property
     def device_info(self) -> DeviceInfo:
         """Return device information about this EM1003 device."""
@@ -170,15 +175,56 @@ class EM1003Sensor(CoordinatorEntity, SensorEntity):
     @property
     def native_value(self) -> float | None:
         """Return the state of the sensor."""
-        if self.coordinator.data is None:
-            return None
-        return self.coordinator.data.get(self._sensor_id)
+        # Get current value from coordinator
+        current_value = None
+        if self.coordinator.data is not None:
+            current_value = self.coordinator.data.get(self._sensor_id)
+
+        # If we have a valid new value, update cache
+        if current_value is not None:
+            self._last_valid_value = current_value
+            self._last_update_time = datetime.now()
+            return current_value
+
+        # No new data available, check if we should use cached value
+        if self._last_valid_value is not None and self._last_update_time is not None:
+            time_since_update = datetime.now() - self._last_update_time
+
+            # If less than 20 minutes, return cached value
+            if time_since_update < self._stale_threshold:
+                _LOGGER.debug(
+                    "Sensor %s (0x%02x): No new data, using cached value %.3f (age: %s)",
+                    self._sensor_info["name"],
+                    self._sensor_id,
+                    self._last_valid_value,
+                    time_since_update
+                )
+                return self._last_valid_value
+            else:
+                # Data is too old, mark as unavailable
+                _LOGGER.warning(
+                    "Sensor %s (0x%02x): Data stale for %s (>20min), marking unavailable",
+                    self._sensor_info["name"],
+                    self._sensor_id,
+                    time_since_update
+                )
+
+        # No valid data available
+        return None
 
     @property
     def extra_state_attributes(self) -> dict:
         """Return additional attributes."""
-        return {
+        attrs = {
             "sensor_id": f"0x{self._sensor_id:02x}",
             "note": self._sensor_info.get("note", "Unknown sensor type"),
             "mac_address": self._mac_address,
         }
+
+        # Add last update information if available
+        if self._last_update_time is not None:
+            attrs["last_update"] = self._last_update_time.isoformat()
+            time_since_update = datetime.now() - self._last_update_time
+            attrs["data_age_seconds"] = int(time_since_update.total_seconds())
+
+        return attrs
