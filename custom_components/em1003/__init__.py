@@ -240,6 +240,10 @@ class EM1003Device:
         self._connection_abort_count = 0
         self._last_connection_abort_time: float | None = None
 
+        # Track last connection failure for fast-fail behavior
+        self._last_connection_failure_time: float | None = None
+        self._fast_fail_window = 30.0  # Seconds to fast-fail after connection failure
+
     def _get_random_sequence_id(self) -> int:
         """Get a random unused sequence ID.
 
@@ -519,32 +523,63 @@ class EM1003Device:
             Connected BleakClient instance
 
         Raises:
-            BleakError: If connection fails
+            BleakError: If connection fails or fast-fail is active
         """
         # Check if we already have a valid connection
         if self._client and self._client.is_connected:
             _LOGGER.debug("[CONN] Reusing existing connection to %s", self.mac_address)
             return self._client
 
+        # Fast-fail if we recently failed to connect (unless circuit breaker is testing)
+        if self._last_connection_failure_time is not None:
+            time_since_failure = time.time() - self._last_connection_failure_time
+            circuit_state = self._circuit_breaker.get_state_info()
+
+            # Only fast-fail if we're not in HALF_OPEN state (testing phase)
+            if time_since_failure < self._fast_fail_window and circuit_state.get("state") != "HALF_OPEN":
+                remaining = self._fast_fail_window - time_since_failure
+                _LOGGER.debug(
+                    "[CONN] Fast-fail: Recent connection failure (%.0fs ago), "
+                    "skipping connection attempt for %.0fs more",
+                    time_since_failure, remaining
+                )
+                raise BleakError(
+                    f"Fast-fail: Connection failed {time_since_failure:.0f}s ago, "
+                    f"will retry after {remaining:.0f}s"
+                )
+
         # Need to establish a new connection
         _LOGGER.debug("[CONN] Establishing new connection to %s", self.mac_address)
-        self._client = await self._establish_connection()
 
-        # Subscribe to notifications (only need to do this once per connection)
         try:
-            await self._client.start_notify(EM1003_NOTIFY_CHAR_UUID, self._notification_handler)
-            _LOGGER.debug("[CONN] ✓ Connected and subscribed to %s", self.mac_address)
-        except Exception as err:
-            # Failed to subscribe, disconnect and re-raise
-            _LOGGER.error("[CONN] Failed to subscribe to notifications: %s", err)
-            try:
-                await self._client.disconnect()
-            except Exception:
-                pass
-            self._client = None
-            raise
+            self._client = await self._establish_connection()
 
-        return self._client
+            # Subscribe to notifications (only need to do this once per connection)
+            try:
+                await self._client.start_notify(EM1003_NOTIFY_CHAR_UUID, self._notification_handler)
+                _LOGGER.debug("[CONN] ✓ Connected and subscribed to %s", self.mac_address)
+
+                # Connection successful - clear failure timestamp
+                self._last_connection_failure_time = None
+
+            except Exception as err:
+                # Failed to subscribe, disconnect and re-raise
+                _LOGGER.error("[CONN] Failed to subscribe to notifications: %s", err)
+                try:
+                    await self._client.disconnect()
+                except Exception:
+                    pass
+                self._client = None
+                # Record failure timestamp
+                self._last_connection_failure_time = time.time()
+                raise
+
+            return self._client
+
+        except Exception as err:
+            # Record failure timestamp for fast-fail
+            self._last_connection_failure_time = time.time()
+            raise
 
     async def disconnect(self) -> None:
         """Explicitly disconnect from the device."""
