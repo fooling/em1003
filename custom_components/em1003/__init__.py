@@ -461,7 +461,13 @@ class EM1003Device:
             self.mac_address
         )
 
+        connection_start_time = time.time()
         try:
+            _LOGGER.info(
+                "[CONN_ROOT_CAUSE] Starting connection attempt %d/3 to %s (RSSI: %s)",
+                1, self.mac_address, getattr(device, 'rssi', 'N/A')
+            )
+
             client = await establish_connection(
                 BleakClient,
                 device,
@@ -471,9 +477,10 @@ class EM1003Device:
                 timeout=30.0,  # 30 second timeout per attempt
             )
 
+            connection_duration = time.time() - connection_start_time
             _LOGGER.info(
-                "[DIAG] ✓ Successfully connected to %s",
-                self.mac_address
+                "[CONN_ROOT_CAUSE] ✓ Connection successful to %s (took %.2fs)",
+                self.mac_address, connection_duration
             )
 
             # Reset connection abort tracking on successful connection
@@ -484,36 +491,133 @@ class EM1003Device:
             return client
 
         except Exception as conn_err:
-            # Check if this is a connection abort error
+            connection_duration = time.time() - connection_start_time
+
+            # Analyze the error to determine root cause
             error_message = str(conn_err).lower()
+            error_type = type(conn_err).__name__
+
+            # Categorize the error
             is_connection_abort = (
                 "connection abort" in error_message or
                 "software caused connection abort" in error_message
             )
             is_timeout = "timeout" in error_message or isinstance(conn_err, asyncio.TimeoutError)
+            is_device_unreachable = (
+                "device unreachable" in error_message or
+                "no route to host" in error_message or
+                "host is down" in error_message
+            )
+            is_auth_failed = (
+                "authentication" in error_message or
+                "pairing" in error_message
+            )
+            is_resource_busy = (
+                "resource busy" in error_message or
+                "device busy" in error_message
+            )
 
+            # Build diagnostic context
+            device_rssi = getattr(device, 'rssi', None)
+            device_name = getattr(device, 'name', 'Unknown')
+
+            # Log detailed root cause analysis
+            _LOGGER.error(
+                "[CONN_ROOT_CAUSE] ✗ Connection FAILED to %s after %.2fs",
+                self.mac_address, connection_duration
+            )
+            _LOGGER.error(
+                "[CONN_ROOT_CAUSE] Error type: %s", error_type
+            )
+            _LOGGER.error(
+                "[CONN_ROOT_CAUSE] Error message: %s", conn_err
+            )
+            _LOGGER.error(
+                "[CONN_ROOT_CAUSE] Device info: name=%s, RSSI=%s",
+                device_name, device_rssi
+            )
+
+            # Determine and log the root cause
             if is_connection_abort:
                 self._connection_abort_count += 1
                 self._last_connection_abort_time = time.time()
-                _LOGGER.warning(
-                    "[DIAG] ✗ Connection abort for %s (will use backoff on retry)",
-                    self.mac_address
+                _LOGGER.error(
+                    "[CONN_ROOT_CAUSE] Root cause: CONNECTION ABORT - "
+                    "Bluetooth stack aborted connection (count: %d). "
+                    "Possible reasons: device too far, interference, device busy, or Bluetooth stack overload",
+                    self._connection_abort_count
                 )
             elif is_timeout:
-                # Timeout is common, don't log full traceback
                 _LOGGER.error(
-                    "[DIAG] ✗ Failed to connect to %s: %s",
-                    self.mac_address,
-                    conn_err
+                    "[CONN_ROOT_CAUSE] Root cause: TIMEOUT - "
+                    "Device did not respond within 30s. "
+                    "Possible reasons: device out of range (RSSI: %s), device sleeping, "
+                    "or device not advertising",
+                    device_rssi
+                )
+            elif is_device_unreachable:
+                _LOGGER.error(
+                    "[CONN_ROOT_CAUSE] Root cause: DEVICE UNREACHABLE - "
+                    "Device cannot be reached. "
+                    "Possible reasons: device powered off, out of range (RSSI: %s), "
+                    "or Bluetooth adapter issue",
+                    device_rssi
+                )
+            elif is_auth_failed:
+                _LOGGER.error(
+                    "[CONN_ROOT_CAUSE] Root cause: AUTHENTICATION/PAIRING FAILED - "
+                    "Device rejected pairing or authentication. "
+                    "Possible reasons: device requires pairing, incorrect PIN, or bonding issue"
+                )
+            elif is_resource_busy:
+                _LOGGER.error(
+                    "[CONN_ROOT_CAUSE] Root cause: RESOURCE BUSY - "
+                    "Bluetooth resource is busy. "
+                    "Possible reasons: another process connected to device, "
+                    "Bluetooth adapter busy, or previous connection not fully closed"
                 )
             else:
-                # Other errors may be bugs, log with traceback
                 _LOGGER.error(
-                    "[DIAG] ✗ Failed to connect to %s: %s",
-                    self.mac_address,
-                    conn_err,
+                    "[CONN_ROOT_CAUSE] Root cause: UNKNOWN ERROR - "
+                    "Unexpected error during connection. "
+                    "Check device status, Bluetooth adapter, and system logs",
                     exc_info=True
                 )
+
+            # Log environmental factors
+            if device_rssi is not None:
+                if device_rssi < -90:
+                    _LOGGER.warning(
+                        "[CONN_ROOT_CAUSE] ⚠ Signal strength VERY WEAK (RSSI: %s dBm). "
+                        "Device is likely too far away or obstructed",
+                        device_rssi
+                    )
+                elif device_rssi < -80:
+                    _LOGGER.warning(
+                        "[CONN_ROOT_CAUSE] ⚠ Signal strength WEAK (RSSI: %s dBm). "
+                        "Connection may be unreliable",
+                        device_rssi
+                    )
+                elif device_rssi < -70:
+                    _LOGGER.info(
+                        "[CONN_ROOT_CAUSE] Signal strength FAIR (RSSI: %s dBm)",
+                        device_rssi
+                    )
+                else:
+                    _LOGGER.info(
+                        "[CONN_ROOT_CAUSE] Signal strength GOOD (RSSI: %s dBm)",
+                        device_rssi
+                    )
+
+            # Log recommended actions
+            _LOGGER.error(
+                "[CONN_ROOT_CAUSE] Recommended actions: "
+                "1) Check device is powered on and nearby, "
+                "2) Check for Bluetooth interference, "
+                "3) Restart Bluetooth adapter if issues persist, "
+                "4) Check Home Assistant Bluetooth integration logs"
+            )
+
             raise
 
     async def _ensure_connected(self) -> BleakClient:
