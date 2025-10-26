@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
+from dataclasses import dataclass
 
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
@@ -41,6 +43,106 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
+
+
+@dataclass
+class PendingRequest:
+    """Represents a pending sensor read request."""
+
+    seq_id: int
+    sensor_id: int
+    future: asyncio.Future
+    timestamp: float
+
+
+class CircuitBreaker:
+    """Circuit breaker pattern to prevent request pile-up during connection failures.
+
+    States:
+    - CLOSED: Normal operation, requests allowed
+    - OPEN: Too many failures, requests blocked for 60 seconds
+    - HALF_OPEN: After timeout, allow one test request
+    """
+
+    def __init__(self, failure_threshold: int = 3, open_duration: float = 60.0):
+        """Initialize circuit breaker.
+
+        Args:
+            failure_threshold: Number of failures before opening circuit
+            open_duration: Seconds to wait before entering half-open state
+        """
+        self.state = "CLOSED"
+        self.failure_count = 0
+        self.failure_threshold = failure_threshold
+        self.open_time: float | None = None
+        self.open_duration = open_duration
+
+    def record_success(self) -> None:
+        """Record successful operation - reset to CLOSED state."""
+        self.failure_count = 0
+        self.state = "CLOSED"
+        self.open_time = None
+        _LOGGER.debug("[CIRCUIT] ✓ Success recorded, circuit CLOSED")
+
+    def record_failure(self) -> None:
+        """Record failed operation - may open circuit."""
+        self.failure_count += 1
+        _LOGGER.debug(
+            "[CIRCUIT] ✗ Failure recorded (%d/%d)",
+            self.failure_count,
+            self.failure_threshold
+        )
+
+        if self.failure_count >= self.failure_threshold:
+            self.state = "OPEN"
+            self.open_time = time.time()
+            _LOGGER.warning(
+                "[CIRCUIT] Circuit OPEN due to %d consecutive failures. "
+                "Blocking requests for %.0f seconds",
+                self.failure_count,
+                self.open_duration
+            )
+
+    def can_attempt(self) -> tuple[bool, str]:
+        """Check if request can proceed.
+
+        Returns:
+            Tuple of (can_proceed, reason)
+        """
+        if self.state == "CLOSED":
+            return True, "Circuit closed"
+
+        elif self.state == "OPEN":
+            if self.open_time is None:
+                # Shouldn't happen, but handle gracefully
+                self.state = "CLOSED"
+                return True, "Circuit reset"
+
+            elapsed = time.time() - self.open_time
+            if elapsed >= self.open_duration:
+                self.state = "HALF_OPEN"
+                _LOGGER.info(
+                    "[CIRCUIT] Circuit entering HALF_OPEN state after %.0f seconds",
+                    elapsed
+                )
+                return True, "Circuit half-open (testing)"
+
+            remaining = self.open_duration - elapsed
+            return False, f"Circuit open ({remaining:.0f}s remaining)"
+
+        else:  # HALF_OPEN
+            return True, "Circuit half-open (testing)"
+
+    def get_state_info(self) -> str:
+        """Get human-readable state information."""
+        if self.state == "CLOSED":
+            return f"CLOSED (failures: {self.failure_count})"
+        elif self.state == "OPEN" and self.open_time:
+            elapsed = time.time() - self.open_time
+            remaining = max(0, self.open_duration - elapsed)
+            return f"OPEN (blocking for {remaining:.0f}s)"
+        else:
+            return "HALF_OPEN (testing)"
 
 
 async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str | None:
@@ -96,16 +198,78 @@ class EM1003Device:
         self.hass = hass
         self.mac_address = mac_address
         self._client: BleakClient | None = None
-        self._notify_future: asyncio.Future | None = None
-        self._sequence_id = 0xA0  # Start sequence ID
         self.sensor_data: dict[int, float | None] = {}
         self._connection_lock = asyncio.Lock()  # Prevent concurrent connections
         self._last_disconnect_time: float | None = None
 
-    def _get_next_sequence_id(self) -> int:
-        """Get next sequence ID for requests."""
-        self._sequence_id = (self._sequence_id + 1) % 0x100
-        return self._sequence_id
+        # Request cache for matching responses to requests
+        # Key: (seq_id, sensor_id), Value: PendingRequest
+        self._pending_requests: dict[tuple[int, int], PendingRequest] = {}
+        self._used_seq_ids: set[int] = set()  # Track used sequence IDs
+
+        # Circuit breaker to prevent request pile-up
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=3,
+            open_duration=60.0
+        )
+
+    def _get_random_sequence_id(self) -> int:
+        """Get a random unused sequence ID.
+
+        Uses random IDs to avoid collisions when multiple requests are in flight.
+        Cache is limited to 256 entries (max possible sequence IDs).
+        """
+        # Clean up old sequence IDs if cache is getting full
+        if len(self._used_seq_ids) >= 250:
+            _LOGGER.debug(
+                "[SEQ] Cache nearly full (%d), clearing old sequence IDs",
+                len(self._used_seq_ids)
+            )
+            self._used_seq_ids.clear()
+
+        # Try to find an unused random sequence ID
+        for attempt in range(100):
+            seq_id = random.randint(0, 255)
+            if seq_id not in self._used_seq_ids:
+                self._used_seq_ids.add(seq_id)
+                return seq_id
+
+        # Fallback: sequential search
+        for seq_id in range(256):
+            if seq_id not in self._used_seq_ids:
+                self._used_seq_ids.add(seq_id)
+                _LOGGER.debug("[SEQ] Used sequential fallback, seq_id=%02x", seq_id)
+                return seq_id
+
+        # Last resort: clear and start over
+        _LOGGER.warning("[SEQ] All 256 sequence IDs exhausted, clearing cache")
+        self._used_seq_ids.clear()
+        seq_id = random.randint(0, 255)
+        self._used_seq_ids.add(seq_id)
+        return seq_id
+
+    def _cleanup_expired_requests(self, max_age: float = 10.0) -> None:
+        """Clean up expired pending requests.
+
+        Args:
+            max_age: Maximum age in seconds for a pending request
+        """
+        now = time.time()
+        expired_keys = [
+            key for key, req in self._pending_requests.items()
+            if now - req.timestamp > max_age
+        ]
+
+        for key in expired_keys:
+            seq_id, sensor_id = key
+            req = self._pending_requests.pop(key)
+            self._used_seq_ids.discard(seq_id)
+            if not req.future.done():
+                req.future.cancel()
+            _LOGGER.debug(
+                "[CACHE] Cleaned up expired request: seq=%02x, sensor=%02x (age=%.1fs)",
+                seq_id, sensor_id, now - req.timestamp
+            )
 
     async def _ensure_connection_delay(self) -> None:
         """Ensure sufficient delay since last disconnect to avoid connection issues."""
@@ -261,7 +425,11 @@ class EM1003Device:
             raise
 
     def _notification_handler(self, sender, data: bytearray) -> None:
-        """Handle notification from device."""
+        """Handle notification from device.
+
+        Validates response matches pending request by checking (seq_id, sensor_id).
+        This prevents accepting wrong responses due to timing issues.
+        """
         try:
             _LOGGER.debug("Received notification from %s: %s", self.mac_address, data.hex())
 
@@ -274,8 +442,20 @@ class EM1003Device:
             sensor_id = data[2]
             value_bytes = data[3:]
 
-            _LOGGER.info(
-                "Parsed notification: seq=%02x, cmd=%02x, sensor=%02x, value=%s",
+            # Find matching pending request using (seq_id, sensor_id) key
+            request_key = (seq_id, sensor_id)
+            pending_request = self._pending_requests.get(request_key)
+
+            if not pending_request:
+                _LOGGER.warning(
+                    "[RESP] ✗ Received unexpected response: seq=%02x, sensor=%02x, value=%s "
+                    "(no matching pending request)",
+                    seq_id, sensor_id, value_bytes.hex()
+                )
+                return
+
+            _LOGGER.debug(
+                "[RESP] ✓ Matched response: seq=%02x, cmd=%02x, sensor=%02x, value=%s",
                 seq_id, cmd_type, sensor_id, value_bytes.hex()
             )
 
@@ -283,12 +463,14 @@ class EM1003Device:
             # Value is in little-endian format (e.g., 0x31 0x00 = 49)
             if len(value_bytes) >= 2:
                 raw_value = int.from_bytes(value_bytes[:2], byteorder='little')
-                _LOGGER.info("Sensor %02x raw value: %d (0x%s)", sensor_id, raw_value, value_bytes[:2].hex())
+                _LOGGER.debug(
+                    "[RESP] Sensor 0x%02x raw value: %d (0x%s)",
+                    sensor_id, raw_value, value_bytes[:2].hex()
+                )
 
                 # Apply sensor-specific scaling and offsets
                 if sensor_id == 0x01:
                     # Temperature: (raw - 4000) / 100
-                    # Offset allows negative temperatures (e.g., -40°C = raw 0)
                     self.sensor_data[sensor_id] = (raw_value - 4000) / 100.0
                 elif sensor_id == 0x06:
                     # Humidity: raw / 100
@@ -303,9 +485,22 @@ class EM1003Device:
                     # Other sensors use raw value directly
                     self.sensor_data[sensor_id] = raw_value
 
-            # Set the future result if waiting
-            if self._notify_future and not self._notify_future.done():
-                self._notify_future.set_result(data)
+                _LOGGER.debug(
+                    "[RESP] Sensor 0x%02x parsed value: %s",
+                    sensor_id, self.sensor_data.get(sensor_id)
+                )
+
+            # Complete the future and remove from pending requests
+            if not pending_request.future.done():
+                pending_request.future.set_result(data)
+
+            del self._pending_requests[request_key]
+            self._used_seq_ids.discard(seq_id)
+            _LOGGER.debug(
+                "[CACHE] Removed completed request (seq=%02x, sensor=%02x). "
+                "Pending: %d, Used seq_ids: %d",
+                seq_id, sensor_id, len(self._pending_requests), len(self._used_seq_ids)
+            )
 
         except Exception as err:
             _LOGGER.error("Error handling notification: %s", err, exc_info=True)
@@ -319,8 +514,20 @@ class EM1003Device:
         Returns:
             Sensor value or None if reading fails
         """
+        # Check circuit breaker
+        can_attempt, reason = self._circuit_breaker.can_attempt()
+        if not can_attempt:
+            _LOGGER.warning(
+                "[CIRCUIT] Blocked read_sensor for 0x%02x: %s",
+                sensor_id, reason
+            )
+            return None
+
         # Use lock to prevent concurrent connection attempts
         async with self._connection_lock:
+            # Clean up expired requests
+            self._cleanup_expired_requests()
+
             try:
                 # Establish connection with improved error handling
                 client = await self._establish_connection()
@@ -332,46 +539,66 @@ class EM1003Device:
                     await client.start_notify(EM1003_NOTIFY_CHAR_UUID, self._notification_handler)
                     _LOGGER.debug("Subscribed to notifications")
 
-                    # Prepare request
-                    seq_id = self._get_next_sequence_id()
+                    # Prepare request with random sequence ID
+                    seq_id = self._get_random_sequence_id()
                     request = bytes([seq_id, CMD_READ_SENSOR, sensor_id])
 
-                    _LOGGER.info(
-                        "Sending request to sensor %02x: %s",
-                        sensor_id, request.hex()
+                    _LOGGER.debug(
+                        "Sending request to sensor 0x%02x: seq=%02x, data=%s",
+                        sensor_id, seq_id, request.hex()
                     )
 
-                    # Create future for response
-                    self._notify_future = asyncio.Future()
+                    # Create pending request and add to cache
+                    pending_request = PendingRequest(
+                        seq_id=seq_id,
+                        sensor_id=sensor_id,
+                        future=asyncio.Future(),
+                        timestamp=time.time()
+                    )
+                    request_key = (seq_id, sensor_id)
+                    self._pending_requests[request_key] = pending_request
 
                     # Send request
                     await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
 
                     # Wait for response with timeout
                     try:
-                        await asyncio.wait_for(self._notify_future, timeout=5.0)
+                        await asyncio.wait_for(pending_request.future, timeout=5.0)
+                        value = self.sensor_data.get(sensor_id)
+                        self._circuit_breaker.record_success()
+                        return value
                     except asyncio.TimeoutError:
-                        _LOGGER.warning("Timeout waiting for sensor %02x response", sensor_id)
+                        _LOGGER.warning(
+                            "Timeout waiting for sensor 0x%02x response (seq=%02x)",
+                            sensor_id, seq_id
+                        )
+                        # Clean up pending request
+                        self._pending_requests.pop(request_key, None)
+                        self._used_seq_ids.discard(seq_id)
+                        self._circuit_breaker.record_failure()
                         return None
+                    finally:
+                        # Stop notifications
+                        await client.stop_notify(EM1003_NOTIFY_CHAR_UUID)
 
-                    # Stop notifications
-                    await client.stop_notify(EM1003_NOTIFY_CHAR_UUID)
-
-                    # Return parsed value
-                    return self.sensor_data.get(sensor_id)
                 finally:
                     await client.disconnect()
                     self._last_disconnect_time = time.time()
 
             except BleakError as err:
                 _LOGGER.error("Bleak error reading sensor %02x: %s", sensor_id, err)
+                self._circuit_breaker.record_failure()
                 return None
             except Exception as err:
                 _LOGGER.error("Error reading sensor %02x: %s", sensor_id, err, exc_info=True)
+                self._circuit_breaker.record_failure()
                 return None
 
     async def read_all_sensors(self) -> dict[int, float | None]:
         """Read all sensors and return their values.
+
+        Uses circuit breaker pattern to prevent request pile-up during failures.
+        Uses request cache to match responses to requests by (seq_id, sensor_id).
 
         Returns:
             Dictionary mapping sensor IDs to their values
@@ -379,10 +606,31 @@ class EM1003Device:
         _LOGGER.debug("[DIAG] read_all_sensors called for %s", self.mac_address)
         results = {}
 
+        # Check circuit breaker before attempting connection
+        can_attempt, reason = self._circuit_breaker.can_attempt()
+        if not can_attempt:
+            _LOGGER.warning(
+                "[CIRCUIT] Blocked read_all_sensors: %s. State: %s",
+                reason,
+                self._circuit_breaker.get_state_info()
+            )
+            # Return None for all sensors when circuit is open
+            return {sensor_id: None for sensor_id in SENSOR_TYPES.keys()}
+
+        _LOGGER.debug(
+            "[CIRCUIT] Attempt allowed: %s. State: %s",
+            reason,
+            self._circuit_breaker.get_state_info()
+        )
+
         # Use lock to prevent concurrent connection attempts
         _LOGGER.debug("[DIAG] Acquiring connection lock for %s", self.mac_address)
         async with self._connection_lock:
             _LOGGER.debug("[DIAG] Connection lock acquired for %s", self.mac_address)
+
+            # Clean up any expired requests before starting
+            self._cleanup_expired_requests()
+
             try:
                 # Establish connection with improved error handling
                 _LOGGER.debug("[DIAG] Calling _establish_connection for %s", self.mac_address)
@@ -409,58 +657,83 @@ class EM1003Device:
 
                     for idx, sensor_id in enumerate(SENSOR_TYPES.keys(), 1):
                         try:
-                            # Prepare request
-                            seq_id = self._get_next_sequence_id()
+                            # Get random sequence ID to avoid collisions
+                            seq_id = self._get_random_sequence_id()
                             request = bytes([seq_id, CMD_READ_SENSOR, sensor_id])
 
                             _LOGGER.debug(
-                                "[DIAG] [%d/%d] Sending request to sensor 0x%02x: %s",
-                                idx, sensor_count, sensor_id, request.hex()
+                                "[REQ] [%d/%d] Sending request: seq=%02x, sensor=0x%02x, data=%s",
+                                idx, sensor_count, seq_id, sensor_id, request.hex()
                             )
 
-                            # Create future for response
-                            self._notify_future = asyncio.Future()
+                            # Create pending request and add to cache
+                            pending_request = PendingRequest(
+                                seq_id=seq_id,
+                                sensor_id=sensor_id,
+                                future=asyncio.Future(),
+                                timestamp=time.time()
+                            )
+                            request_key = (seq_id, sensor_id)
+                            self._pending_requests[request_key] = pending_request
 
                             # Send request
                             await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
 
                             # Wait for response with timeout
                             try:
-                                await asyncio.wait_for(self._notify_future, timeout=5.0)
-                                # Get parsed value
+                                await asyncio.wait_for(pending_request.future, timeout=5.0)
+                                # Get parsed value from sensor_data (set by notification handler)
                                 value = self.sensor_data.get(sensor_id)
                                 results[sensor_id] = value
                                 _LOGGER.debug(
-                                    "[DIAG] [%d/%d] ✓ Sensor 0x%02x = %s",
+                                    "[REQ] [%d/%d] ✓ Sensor 0x%02x = %s",
                                     idx, sensor_count, sensor_id, value
                                 )
                             except asyncio.TimeoutError:
                                 _LOGGER.warning(
-                                    "[DIAG] [%d/%d] ✗ Timeout waiting for sensor 0x%02x response",
-                                    idx, sensor_count, sensor_id
+                                    "[REQ] [%d/%d] ✗ Timeout waiting for sensor 0x%02x response (seq=%02x)",
+                                    idx, sensor_count, sensor_id, seq_id
                                 )
                                 results[sensor_id] = None
+                                # Clean up pending request on timeout
+                                self._pending_requests.pop(request_key, None)
+                                self._used_seq_ids.discard(seq_id)
 
                             # Small delay between sensor reads
                             await asyncio.sleep(0.3)
 
                         except Exception as err:
                             _LOGGER.error(
-                                "[DIAG] [%d/%d] ✗ Error reading sensor 0x%02x: %s",
+                                "[REQ] [%d/%d] ✗ Error reading sensor 0x%02x: %s",
                                 idx, sensor_count, sensor_id, err
                             )
                             results[sensor_id] = None
+                            # Clean up on error
+                            request_key = (seq_id, sensor_id)
+                            self._pending_requests.pop(request_key, None)
+                            self._used_seq_ids.discard(seq_id)
 
                     # Stop notifications
                     _LOGGER.debug("[DIAG] Stopping notifications...")
                     await client.stop_notify(EM1003_NOTIFY_CHAR_UUID)
                     _LOGGER.debug("[DIAG] ✓ Notifications stopped")
 
+                    success_count = sum(1 for v in results.values() if v is not None)
                     _LOGGER.info(
                         "[DIAG] Completed reading all sensors. Success: %d/%d",
-                        sum(1 for v in results.values() if v is not None),
+                        success_count,
                         len(results)
                     )
+
+                    # Record success or failure to circuit breaker
+                    if success_count >= len(results) * 0.5:  # At least 50% success
+                        self._circuit_breaker.record_success()
+                    else:
+                        _LOGGER.warning(
+                            "[CIRCUIT] Low success rate (%d/%d), recording failure",
+                            success_count, len(results)
+                        )
+                        self._circuit_breaker.record_failure()
 
                 finally:
                     _LOGGER.debug("[DIAG] Disconnecting from %s...", self.mac_address)
@@ -473,11 +746,13 @@ class EM1003Device:
                     "[DIAG] ✗ Bleak error reading all sensors from %s: %s",
                     self.mac_address, err
                 )
+                self._circuit_breaker.record_failure()
             except Exception as err:
                 _LOGGER.error(
                     "[DIAG] ✗ Error reading all sensors from %s: %s",
                     self.mac_address, err, exc_info=True
                 )
+                self._circuit_breaker.record_failure()
 
         _LOGGER.debug("[DIAG] Released connection lock for %s", self.mac_address)
         return results
