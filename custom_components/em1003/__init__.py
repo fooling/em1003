@@ -670,6 +670,17 @@ class EM1003Device:
                     )
 
                     for idx, sensor_id in enumerate(SENSOR_TYPES.keys(), 1):
+                        # Check if connection is still valid before each read
+                        if not client.is_connected:
+                            _LOGGER.warning(
+                                "[REQ] [%d/%d] Connection lost, aborting remaining sensor reads",
+                                idx, sensor_count
+                            )
+                            # Mark remaining sensors as None
+                            for remaining_id in list(SENSOR_TYPES.keys())[idx-1:]:
+                                results[remaining_id] = None
+                            break
+
                         try:
                             # Get random sequence ID to avoid collisions
                             seq_id = self._get_random_sequence_id()
@@ -716,6 +727,27 @@ class EM1003Device:
                             # Small delay between sensor reads
                             await asyncio.sleep(0.3)
 
+                        except BleakError as err:
+                            _LOGGER.error(
+                                "[REQ] [%d/%d] ✗ BLE error reading sensor 0x%02x: %s",
+                                idx, sensor_count, sensor_id, err
+                            )
+                            results[sensor_id] = None
+                            # Clean up on error
+                            request_key = (seq_id, sensor_id)
+                            self._pending_requests.pop(request_key, None)
+                            self._used_seq_ids.discard(seq_id)
+
+                            # If we get a BLE error, connection might be broken
+                            # Check and abort if disconnected
+                            if not client.is_connected:
+                                _LOGGER.warning(
+                                    "[REQ] Connection lost after BLE error, aborting remaining reads"
+                                )
+                                # Mark remaining sensors as None
+                                for remaining_id in list(SENSOR_TYPES.keys())[idx:]:
+                                    results[remaining_id] = None
+                                break
                         except Exception as err:
                             _LOGGER.error(
                                 "[REQ] [%d/%d] ✗ Error reading sensor 0x%02x: %s",
@@ -727,10 +759,16 @@ class EM1003Device:
                             self._pending_requests.pop(request_key, None)
                             self._used_seq_ids.discard(seq_id)
 
-                    # Stop notifications
-                    _LOGGER.debug("[DIAG] Stopping notifications...")
-                    await client.stop_notify(EM1003_NOTIFY_CHAR_UUID)
-                    _LOGGER.debug("[DIAG] ✓ Notifications stopped")
+                    # Stop notifications (if still connected)
+                    if client.is_connected:
+                        try:
+                            _LOGGER.debug("[DIAG] Stopping notifications...")
+                            await client.stop_notify(EM1003_NOTIFY_CHAR_UUID)
+                            _LOGGER.debug("[DIAG] ✓ Notifications stopped")
+                        except Exception as err:
+                            _LOGGER.debug("[DIAG] Could not stop notifications (connection may be lost): %s", err)
+                    else:
+                        _LOGGER.debug("[DIAG] Connection already lost, skipping notification stop")
 
                     success_count = sum(1 for v in results.values() if v is not None)
                     _LOGGER.info(
@@ -750,10 +788,19 @@ class EM1003Device:
                         self._circuit_breaker.record_failure()
 
                 finally:
-                    _LOGGER.debug("[DIAG] Disconnecting from %s...", self.mac_address)
-                    await client.disconnect()
-                    self._last_disconnect_time = time.time()
-                    _LOGGER.debug("[DIAG] ✓ Disconnected from device %s", self.mac_address)
+                    # Disconnect if still connected
+                    if client.is_connected:
+                        try:
+                            _LOGGER.debug("[DIAG] Disconnecting from %s...", self.mac_address)
+                            await client.disconnect()
+                            self._last_disconnect_time = time.time()
+                            _LOGGER.debug("[DIAG] ✓ Disconnected from device %s", self.mac_address)
+                        except Exception as err:
+                            _LOGGER.debug("[DIAG] Error during disconnect: %s", err)
+                            self._last_disconnect_time = time.time()
+                    else:
+                        _LOGGER.debug("[DIAG] Already disconnected from %s", self.mac_address)
+                        self._last_disconnect_time = time.time()
 
             except BleakError as err:
                 _LOGGER.error(
