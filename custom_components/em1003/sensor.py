@@ -43,8 +43,20 @@ async def async_setup_entry(
     # Create coordinator for updating sensor data
     coordinator = EM1003DataUpdateCoordinator(hass, em1003_device, mac_address)
 
-    # Fetch initial data
-    await coordinator.async_config_entry_first_refresh()
+    # Add a small delay before first refresh to allow device to be ready
+    _LOGGER.debug("Waiting for device to be ready before initial refresh...")
+    await asyncio.sleep(2.0)
+
+    # Fetch initial data with better error handling
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except Exception as err:
+        _LOGGER.warning(
+            "Initial data fetch failed for %s, sensors will retry automatically: %s",
+            mac_address,
+            err
+        )
+        # Don't fail setup - let sensors show unavailable and retry later
 
     # Create sensor entities for each sensor type
     entities = []

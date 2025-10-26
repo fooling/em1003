@@ -64,7 +64,7 @@ async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str |
             device,
             mac_address,
             disconnected_callback=lambda _: None,
-            max_attempts=3,
+            max_attempts=5,  # Increased retry attempts
         )
 
         try:
@@ -177,7 +177,7 @@ class EM1003Device:
                 device,
                 self.mac_address,
                 disconnected_callback=lambda _: None,
-                max_attempts=3,
+                max_attempts=5,  # Increased retry attempts
             )
 
             try:
@@ -232,11 +232,76 @@ class EM1003Device:
         """
         results = {}
 
-        for sensor_id in SENSOR_TYPES.keys():
-            value = await self.read_sensor(sensor_id)
-            results[sensor_id] = value
-            # Small delay between reads
-            await asyncio.sleep(0.5)
+        try:
+            device = bluetooth.async_ble_device_from_address(
+                self.hass, self.mac_address, connectable=True
+            )
+
+            if not device:
+                _LOGGER.error("Device not found: %s", self.mac_address)
+                return results
+
+            # Establish connection once for all sensors
+            client = await establish_connection(
+                BleakClient,
+                device,
+                self.mac_address,
+                disconnected_callback=lambda _: None,
+                max_attempts=5,  # Increased retry attempts
+            )
+
+            try:
+                _LOGGER.debug("Connected to device %s for reading all sensors", self.mac_address)
+
+                # Subscribe to notifications once
+                await client.start_notify(EM1003_NOTIFY_CHAR_UUID, self._notification_handler)
+                _LOGGER.debug("Subscribed to notifications")
+
+                # Read all sensors using the same connection
+                for sensor_id in SENSOR_TYPES.keys():
+                    try:
+                        # Prepare request
+                        seq_id = self._get_next_sequence_id()
+                        request = bytes([seq_id, CMD_READ_SENSOR, sensor_id])
+
+                        _LOGGER.debug(
+                            "Sending request to sensor %02x: %s",
+                            sensor_id, request.hex()
+                        )
+
+                        # Create future for response
+                        self._notify_future = asyncio.Future()
+
+                        # Send request
+                        await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
+
+                        # Wait for response with timeout
+                        try:
+                            await asyncio.wait_for(self._notify_future, timeout=5.0)
+                            # Get parsed value
+                            results[sensor_id] = self.sensor_data.get(sensor_id)
+                        except asyncio.TimeoutError:
+                            _LOGGER.warning("Timeout waiting for sensor %02x response", sensor_id)
+                            results[sensor_id] = None
+
+                        # Small delay between sensor reads
+                        await asyncio.sleep(0.3)
+
+                    except Exception as err:
+                        _LOGGER.error("Error reading sensor %02x: %s", sensor_id, err)
+                        results[sensor_id] = None
+
+                # Stop notifications
+                await client.stop_notify(EM1003_NOTIFY_CHAR_UUID)
+
+            finally:
+                await client.disconnect()
+                _LOGGER.debug("Disconnected from device %s", self.mac_address)
+
+        except BleakError as err:
+            _LOGGER.error("Bleak error reading all sensors: %s", err)
+        except Exception as err:
+            _LOGGER.error("Error reading all sensors: %s", err, exc_info=True)
 
         return results
 
@@ -341,7 +406,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 device,
                 mac_address,
                 disconnected_callback=lambda _: None,
-                max_attempts=3,
+                max_attempts=5,  # Increased retry attempts
             )
 
             try:
@@ -410,7 +475,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 device,
                 mac_address,
                 disconnected_callback=lambda _: None,
-                max_attempts=3,
+                max_attempts=5,  # Increased retry attempts
             )
 
             try:
@@ -450,7 +515,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 device,
                 mac_address,
                 disconnected_callback=lambda _: None,
-                max_attempts=3,
+                max_attempts=5,  # Increased retry attempts
             )
 
             try:
@@ -510,7 +575,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 device,
                 mac_address,
                 disconnected_callback=lambda _: None,
-                max_attempts=3,
+                max_attempts=5,  # Increased retry attempts
             )
 
             try:
