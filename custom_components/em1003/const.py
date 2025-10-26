@@ -115,8 +115,12 @@ SENSOR_TYPES = {
     },
 }
 
+# Configuration keys
+CONF_SCAN_INTERVAL = "scan_interval"
+
 # Default values
 DEFAULT_NAME = "EM1003"
+DEFAULT_SCAN_INTERVAL = 60  # Default polling interval in seconds
 DEVICE_TIMEOUT = 30.0
 
 # Version

@@ -20,5 +20,19 @@
     "abort": {
       "already_configured": "设备已配置"
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "EM1003 配置选项",
+        "description": "配置 EM1003 传感器的参数",
+        "data": {
+          "scan_interval": "采样周期（秒）"
+        },
+        "data_description": {
+          "scan_interval": "传感器数据采集的时间间隔，范围 10-600 秒，默认 60 秒。较长的间隔可以提高稳定性并节省设备电量。"
+        }
+      }
+    }
   }
 }

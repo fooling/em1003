@@ -20,11 +20,9 @@ from homeassistant.helpers.update_coordinator import (
     UpdateFailed,
 )
 
-from .const import DOMAIN, CONF_MAC_ADDRESS, SENSOR_TYPES
+from .const import DOMAIN, CONF_MAC_ADDRESS, SENSOR_TYPES, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
-
-SCAN_INTERVAL = timedelta(seconds=30)  # Poll every 30 seconds
 
 
 async def async_setup_entry(
@@ -40,8 +38,13 @@ async def async_setup_entry(
 
     _LOGGER.info("Setting up EM1003 sensors for device: %s (%s)", device_name, mac_address)
 
+    # Get scan interval from options or use default
+    scan_interval_seconds = config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+    scan_interval = timedelta(seconds=scan_interval_seconds)
+    _LOGGER.info("Using scan interval: %d seconds", scan_interval_seconds)
+
     # Create coordinator for updating sensor data
-    coordinator = EM1003DataUpdateCoordinator(hass, em1003_device, mac_address)
+    coordinator = EM1003DataUpdateCoordinator(hass, em1003_device, mac_address, scan_interval)
 
     # Add a small delay before first refresh to allow device to be ready
     _LOGGER.debug("Waiting for device to be ready before initial refresh...")
@@ -83,13 +86,14 @@ class EM1003DataUpdateCoordinator(DataUpdateCoordinator):
         hass: HomeAssistant,
         em1003_device,
         mac_address: str,
+        update_interval: timedelta,
     ) -> None:
         """Initialize the coordinator."""
         super().__init__(
             hass,
             _LOGGER,
             name=f"EM1003 {mac_address}",
-            update_interval=SCAN_INTERVAL,
+            update_interval=update_interval,
         )
         self.em1003_device = em1003_device
         self.mac_address = mac_address

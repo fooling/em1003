@@ -14,7 +14,7 @@ from homeassistant.components.bluetooth import (
 from homeassistant.const import CONF_MAC
 from homeassistant.data_entry_flow import FlowResult
 
-from .const import DOMAIN, CONF_MAC_ADDRESS, DEFAULT_NAME
+from .const import DOMAIN, CONF_MAC_ADDRESS, DEFAULT_NAME, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -128,4 +128,41 @@ class EM1003ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders={
                 "discovered": str(len(discovered_devices)) if discovered_devices else "0"
             },
+        )
+
+    @staticmethod
+    def async_get_options_flow(config_entry: config_entries.ConfigEntry):
+        """Get the options flow for this handler."""
+        return EM1003OptionsFlow(config_entry)
+
+
+class EM1003OptionsFlow(config_entries.OptionsFlow):
+    """Handle options flow for EM1003."""
+
+    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+        """Initialize options flow."""
+        self.config_entry = config_entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        # Get current scan interval or use default
+        current_scan_interval = self.config_entry.options.get(
+            CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
+        )
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_SCAN_INTERVAL,
+                        default=current_scan_interval,
+                    ): vol.All(vol.Coerce(int), vol.Range(min=10, max=600)),
+                }
+            ),
         )
