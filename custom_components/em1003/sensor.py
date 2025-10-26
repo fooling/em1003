@@ -180,7 +180,7 @@ class EM1003Sensor(CoordinatorEntity, SensorEntity):
                     self._attr_device_class
                 )
             elif device_class_str:
-                _LOGGER.info(
+                _LOGGER.debug(
                     "Device class '%s' not available in this Home Assistant version for sensor %s (0x%02x)",
                     device_class_str,
                     sensor_info["name"],
