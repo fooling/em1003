@@ -138,11 +138,33 @@ class EM1003Sensor(CoordinatorEntity, SensorEntity):
         self._attr_icon = sensor_info["icon"]
         self._attr_native_unit_of_measurement = sensor_info.get("unit")
 
-        # Set device class if available
-        if sensor_info.get("device_class"):
-            self._attr_device_class = getattr(
-                SensorDeviceClass, sensor_info["device_class"].upper(), None
-            )
+        # Set device class if available - use explicit mapping for better compatibility
+        device_class_str = sensor_info.get("device_class")
+        if device_class_str:
+            # Map string device classes to SensorDeviceClass enum
+            device_class_map = {
+                "temperature": SensorDeviceClass.TEMPERATURE,
+                "humidity": SensorDeviceClass.HUMIDITY,
+                "pm25": SensorDeviceClass.PM25,
+                "pm10": SensorDeviceClass.PM10,
+                "carbon_dioxide": SensorDeviceClass.CARBON_DIOXIDE,
+                "volatile_organic_compounds": SensorDeviceClass.VOLATILE_ORGANIC_COMPOUNDS,
+            }
+            self._attr_device_class = device_class_map.get(device_class_str)
+            if self._attr_device_class:
+                _LOGGER.debug(
+                    "Set device_class for sensor %s (0x%02x): %s",
+                    sensor_info["name"],
+                    sensor_id,
+                    self._attr_device_class
+                )
+            else:
+                _LOGGER.warning(
+                    "Unknown device_class '%s' for sensor %s (0x%02x)",
+                    device_class_str,
+                    sensor_info["name"],
+                    sensor_id
+                )
 
         # Set precision based on sensor type
         if sensor_id == 0x01:  # Temperature
