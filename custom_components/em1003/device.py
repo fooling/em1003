@@ -292,101 +292,35 @@ class EM1003Device:
         # Wait if we recently disconnected to avoid connection abort errors
         await self._ensure_connection_delay()
 
-        # Use Home Assistant's Bluetooth integration to get fresh device info
-        # This avoids using stale cached data from BleakScanner.discover()
+        # Get device from Home Assistant's Bluetooth integration
         _LOGGER.info(
-            "[DIAG] Looking up device %s via Home Assistant Bluetooth integration...",
+            "[DIAG] Getting device %s from Home Assistant Bluetooth integration...",
             self.mac_address
         )
 
-        device = None
-        device_rssi = None
-        max_lookup_attempts = 3
-        min_rssi_threshold = -90  # Don't connect if signal is weaker than -90 dBm
+        device = bluetooth.async_ble_device_from_address(
+            self.hass,
+            self.mac_address,
+            connectable=True
+        )
 
-        for attempt in range(1, max_lookup_attempts + 1):
-            _LOGGER.info(
-                "[DIAG] Lookup attempt %d/%d for %s",
-                attempt, max_lookup_attempts, self.mac_address
-            )
-
-            try:
-                # Get device from Home Assistant's Bluetooth integration
-                # This uses HA's active scanners and provides fresh data
-                device = bluetooth.async_ble_device_from_address(
-                    self.hass,
-                    self.mac_address,
-                    connectable=True
-                )
-
-                if device:
-                    device_rssi = getattr(device, 'rssi', None)
-
-                    _LOGGER.info(
-                        "[DIAG] ✓ Found device %s (Name: %s, RSSI: %s dBm)",
-                        self.mac_address,
-                        device.name or "Unknown",
-                        device_rssi if device_rssi is not None else "N/A"
-                    )
-
-                    # Validate RSSI if available
-                    # Accept device if RSSI is None (may be normal for some scanners)
-                    # Only reject if RSSI is available but too weak
-                    if device_rssi is None:
-                        # RSSI not available - but device was found, so proceed
-                        _LOGGER.info(
-                            "[DIAG] ✓ Device found (RSSI N/A, but proceeding anyway)"
-                        )
-                        break  # Accept device even without RSSI
-                    elif device_rssi < min_rssi_threshold:
-                        _LOGGER.warning(
-                            "[DIAG] ⚠ Device signal too weak (RSSI: %s dBm < %s dBm threshold). "
-                            "Waiting for better signal...",
-                            device_rssi, min_rssi_threshold
-                        )
-                        device = None  # Clear and retry for better signal
-                    else:
-                        # Good signal found!
-                        _LOGGER.info(
-                            "[DIAG] ✓ Device has acceptable signal (RSSI: %s dBm >= %s dBm), proceeding",
-                            device_rssi, min_rssi_threshold
-                        )
-                        break  # Found good device, exit loop
-                else:
-                    _LOGGER.info(
-                        "[DIAG] Device %s not found in Home Assistant's Bluetooth cache",
-                        self.mac_address
-                    )
-
-                # If this isn't the last attempt, wait for fresh scan data
-                if attempt < max_lookup_attempts and device is None:
-                    wait_time = 2.0 * attempt  # Exponential backoff: 2s, 4s, 6s
-                    _LOGGER.info(
-                        "[DIAG] Waiting %.1f seconds for fresh BLE scan data...",
-                        wait_time
-                    )
-                    await asyncio.sleep(wait_time)
-
-            except Exception as lookup_err:
-                _LOGGER.warning(
-                    "[DIAG] Error during device lookup attempt %d/%d: %s",
-                    attempt, max_lookup_attempts, lookup_err,
-                    exc_info=True
-                )
-
-                if attempt < max_lookup_attempts:
-                    await asyncio.sleep(2.0)
-
-        # Check if we found a suitable device
         if not device:
             _LOGGER.error(
-                "[DIAG] ✗ Device %s not found with valid signal after %d attempts",
-                self.mac_address, max_lookup_attempts
+                "[DIAG] ✗ Device %s not found",
+                self.mac_address
             )
             raise BleakError(
-                f"Device not found with valid signal: {self.mac_address}. "
-                "Make sure device is powered on, nearby, and not obstructed."
+                f"Device not found: {self.mac_address}. "
+                "Make sure device is powered on and nearby."
             )
+
+        device_rssi = getattr(device, 'rssi', None)
+        _LOGGER.info(
+            "[DIAG] ✓ Found device %s (Name: %s, RSSI: %s dBm)",
+            self.mac_address,
+            device.name or "Unknown",
+            device_rssi if device_rssi is not None else "N/A"
+        )
 
         # Establish connection with timeout and retry logic
         # CRITICAL: Use max_attempts=1 to prevent slot exhaustion
@@ -842,7 +776,7 @@ class EM1003Device:
 
             # Wait for response with timeout
             try:
-                await asyncio.wait_for(pending_request.future, timeout=5.0)
+                await asyncio.wait_for(pending_request.future, timeout=2.0)
                 value = self.sensor_data.get(sensor_id)
                 self._circuit_breaker.record_success()
                 return value
@@ -972,7 +906,7 @@ class EM1003Device:
 
                     # Wait for response with timeout
                     try:
-                        await asyncio.wait_for(pending_request.future, timeout=5.0)
+                        await asyncio.wait_for(pending_request.future, timeout=2.0)
                         # Get parsed value from sensor_data (set by notification handler)
                         value = self.sensor_data.get(sensor_id)
                         results[sensor_id] = value
@@ -990,7 +924,7 @@ class EM1003Device:
                     except asyncio.TimeoutError:
                         if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
                             _LOGGER.warning(
-                                "[%s] ✗ TIMEOUT (5s) - sensor 0x%02x not responding",
+                                "[%s] ✗ TIMEOUT (2s) - sensor 0x%02x not responding",
                                 sensor_name, sensor_id
                             )
                         else:
