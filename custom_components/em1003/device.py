@@ -389,17 +389,20 @@ class EM1003Device:
             )
 
         # Establish connection with timeout and retry logic
-        # Use fewer attempts with longer timeout to avoid overwhelming Bluetooth stack
+        # CRITICAL: Use max_attempts=1 to prevent slot exhaustion
+        # Each failed attempt can occupy a BLE slot that doesn't get released immediately
+        # Multiple retries can exhaust all available slots, preventing new connections
         _LOGGER.debug(
             "[DIAG] Attempting to establish connection to %s using bleak-retry-connector...",
             self.mac_address
         )
 
         connection_start_time = time.time()
+        client = None
         try:
             _LOGGER.info(
-                "[CONN_ROOT_CAUSE] Starting connection attempt %d/3 to %s (RSSI: %s)",
-                1, self.mac_address, getattr(device, 'rssi', 'N/A')
+                "[CONN_ROOT_CAUSE] Starting connection attempt to %s (RSSI: %s)",
+                self.mac_address, getattr(device, 'rssi', 'N/A')
             )
 
             client = await establish_connection(
@@ -407,7 +410,7 @@ class EM1003Device:
                 device,
                 self.mac_address,
                 disconnected_callback=lambda _: None,
-                max_attempts=3,  # Reduced from 5 to 3 to avoid stack exhaustion
+                max_attempts=1,  # CRITICAL: Reduced to 1 to prevent slot exhaustion
                 timeout=30.0,  # 30 second timeout per attempt
             )
 
@@ -425,6 +428,20 @@ class EM1003Device:
             return client
 
         except Exception as conn_err:
+            # CRITICAL: Clean up any partially established connection
+            # Failed connection attempts can leave slots occupied
+            if client is not None:
+                try:
+                    _LOGGER.debug(
+                        "[CONN_ROOT_CAUSE] Cleaning up failed connection attempt to %s",
+                        self.mac_address
+                    )
+                    await client.disconnect()
+                except Exception as cleanup_err:
+                    _LOGGER.debug(
+                        "[CONN_ROOT_CAUSE] Error during connection cleanup: %s",
+                        cleanup_err
+                    )
             connection_duration = time.time() - connection_start_time
 
             # Analyze the error to determine root cause
@@ -618,10 +635,13 @@ class EM1003Device:
             except Exception as err:
                 # Failed to subscribe, disconnect and re-raise
                 _LOGGER.error("[CONN] Failed to subscribe to notifications: %s", err)
-                try:
-                    await self._client.disconnect()
-                except Exception:
-                    pass
+                # CRITICAL: Ensure connection is properly cleaned up to free slot
+                if self._client is not None:
+                    try:
+                        await self._client.disconnect()
+                        _LOGGER.debug("[CONN] Disconnected after subscription failure to free slot")
+                    except Exception as disconnect_err:
+                        _LOGGER.debug("[CONN] Error during cleanup disconnect: %s", disconnect_err)
                 self._client = None
                 # Record failure timestamp
                 self._last_connection_failure_time = time.time()
@@ -632,6 +652,14 @@ class EM1003Device:
         except Exception as err:
             # Record failure timestamp for fast-fail
             self._last_connection_failure_time = time.time()
+            # CRITICAL: Ensure client is cleared so it doesn't hold a stale connection
+            if self._client is not None:
+                try:
+                    await self._client.disconnect()
+                    _LOGGER.debug("[CONN] Disconnected after connection error to free slot")
+                except Exception:
+                    pass
+                self._client = None
             raise
 
     async def disconnect(self) -> None:
@@ -1065,8 +1093,14 @@ class EM1003Device:
                 self.mac_address, err
             )
             self._circuit_breaker.record_failure()
-            # Clear client so next attempt will create new connection
-            self._client = None
+            # CRITICAL: Disconnect to free connection slot even on error
+            if self._client is not None:
+                try:
+                    await self.disconnect()
+                    _LOGGER.debug("[CONN] Disconnected after BLE error to free slot")
+                except Exception as disconnect_err:
+                    _LOGGER.debug("[CONN] Error during error-path disconnect: %s", disconnect_err)
+                self._client = None
             raise
         except Exception as err:
             # Unexpected error - clean up and record failure
@@ -1075,6 +1109,12 @@ class EM1003Device:
                 self.mac_address, err, exc_info=True
             )
             self._circuit_breaker.record_failure()
-            # Clear client so next attempt will create new connection
-            self._client = None
+            # CRITICAL: Disconnect to free connection slot even on error
+            if self._client is not None:
+                try:
+                    await self.disconnect()
+                    _LOGGER.debug("[CONN] Disconnected after error to free slot")
+                except Exception as disconnect_err:
+                    _LOGGER.debug("[CONN] Error during error-path disconnect: %s", disconnect_err)
+                self._client = None
             raise
