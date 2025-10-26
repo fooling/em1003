@@ -487,6 +487,7 @@ class EM1003Device:
                 "connection abort" in error_message or
                 "software caused connection abort" in error_message
             )
+            is_timeout = "timeout" in error_message or isinstance(conn_err, asyncio.TimeoutError)
 
             if is_connection_abort:
                 self._connection_abort_count += 1
@@ -495,7 +496,15 @@ class EM1003Device:
                     "[DIAG] ✗ Connection abort for %s (will use backoff on retry)",
                     self.mac_address
                 )
+            elif is_timeout:
+                # Timeout is common, don't log full traceback
+                _LOGGER.error(
+                    "[DIAG] ✗ Failed to connect to %s: %s",
+                    self.mac_address,
+                    conn_err
+                )
             else:
+                # Other errors may be bugs, log with traceback
                 _LOGGER.error(
                     "[DIAG] ✗ Failed to connect to %s: %s",
                     self.mac_address,
@@ -728,6 +737,7 @@ class EM1003Device:
         """
         _LOGGER.debug("[DIAG] read_all_sensors called for %s", self.mac_address)
         results = {}
+        connection_established = False  # Track if connection succeeded
 
         # Check circuit breaker before attempting connection
         can_attempt, reason = self._circuit_breaker.can_attempt()
@@ -758,6 +768,7 @@ class EM1003Device:
                 # Establish connection with improved error handling
                 _LOGGER.debug("[DIAG] Calling _establish_connection for %s", self.mac_address)
                 client = await self._establish_connection()
+                connection_established = True  # Mark connection as successful
 
                 try:
                     _LOGGER.info(
@@ -950,16 +961,32 @@ class EM1003Device:
                         self._last_disconnect_time = time.time()
 
             except BleakError as err:
-                _LOGGER.error(
-                    "[DIAG] ✗ Bleak error reading all sensors from %s: %s",
-                    self.mac_address, err
-                )
+                if connection_established:
+                    # Connection succeeded but sensor reading failed
+                    _LOGGER.error(
+                        "[DIAG] ✗ BLE error while reading sensors from %s: %s",
+                        self.mac_address, err
+                    )
+                else:
+                    # Connection failed - _establish_connection already logged detailed error
+                    _LOGGER.error(
+                        "[DIAG] ✗ Failed to connect to %s",
+                        self.mac_address
+                    )
                 self._circuit_breaker.record_failure()
             except Exception as err:
-                _LOGGER.error(
-                    "[DIAG] ✗ Error reading all sensors from %s: %s",
-                    self.mac_address, err, exc_info=True
-                )
+                if connection_established:
+                    # Connection succeeded but sensor reading failed
+                    _LOGGER.error(
+                        "[DIAG] ✗ Error while reading sensors from %s: %s",
+                        self.mac_address, err, exc_info=True
+                    )
+                else:
+                    # Connection failed - _establish_connection already logged detailed error
+                    _LOGGER.error(
+                        "[DIAG] ✗ Failed to connect to %s",
+                        self.mac_address
+                    )
                 self._circuit_breaker.record_failure()
 
         _LOGGER.debug("[DIAG] Released connection lock for %s", self.mac_address)
