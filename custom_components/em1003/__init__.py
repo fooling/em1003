@@ -360,104 +360,98 @@ class EM1003Device:
         # Wait if we recently disconnected to avoid connection abort errors
         await self._ensure_connection_delay()
 
-        # IMPORTANT: Always perform active BLE scan to find device with valid RSSI
-        # Don't rely on cached device data as RSSI may be N/A (outdated)
+        # Use Home Assistant's Bluetooth integration to get fresh device info
+        # This avoids using stale cached data from BleakScanner.discover()
         _LOGGER.info(
-            "[DIAG] Performing active BLE scan for device %s...",
+            "[DIAG] Looking up device %s via Home Assistant Bluetooth integration...",
             self.mac_address
         )
 
         device = None
         device_rssi = None
-        max_scan_attempts = 3
+        max_lookup_attempts = 3
         min_rssi_threshold = -90  # Don't connect if signal is weaker than -90 dBm
 
-        for scan_attempt in range(1, max_scan_attempts + 1):
+        for attempt in range(1, max_lookup_attempts + 1):
             _LOGGER.info(
-                "[DIAG] Scan attempt %d/%d for %s",
-                scan_attempt, max_scan_attempts, self.mac_address
+                "[DIAG] Lookup attempt %d/%d for %s",
+                attempt, max_lookup_attempts, self.mac_address
             )
 
             try:
-                # Perform active scan to discover the device
-                scan_start = time.time()
-                devices = await BleakScanner.discover(timeout=10.0)
-                scan_duration = time.time() - scan_start
-
-                _LOGGER.debug(
-                    "[DIAG] BLE scan completed in %.2f seconds, found %d devices",
-                    scan_duration,
-                    len(devices)
+                # Get device from Home Assistant's Bluetooth integration
+                # This uses HA's active scanners and provides fresh data
+                device = bluetooth.async_ble_device_from_address(
+                    self.hass,
+                    self.mac_address,
+                    connectable=True
                 )
 
-                # Look for our target device in scan results
-                for scanned_device in devices:
-                    if scanned_device.address.upper() == self.mac_address.upper():
-                        device_rssi = getattr(scanned_device, 'rssi', None)
+                if device:
+                    device_rssi = getattr(device, 'rssi', None)
 
-                        _LOGGER.info(
-                            "[DIAG] ✓ Found target device %s (Name: %s, RSSI: %s dBm)",
-                            self.mac_address,
-                            scanned_device.name or "Unknown",
-                            device_rssi if device_rssi is not None else "N/A"
-                        )
-
-                        # Validate RSSI if available, otherwise accept device as found
-                        if device_rssi is None:
-                            # RSSI not available from BleakScanner.discover()
-                            # But device was found, so it's in range - proceed with connection
-                            _LOGGER.info(
-                                "[DIAG] ✓ Device found (RSSI not available from scanner, proceeding anyway)"
-                            )
-                            device = scanned_device
-                            break
-                        elif device_rssi < min_rssi_threshold:
-                            _LOGGER.warning(
-                                "[DIAG] ⚠ Device found but signal too weak (RSSI: %s dBm < %s dBm threshold), "
-                                "continuing to scan for better signal...",
-                                device_rssi, min_rssi_threshold
-                            )
-                            continue  # Keep scanning for better signal
-                        else:
-                            # Good signal found!
-                            _LOGGER.info(
-                                "[DIAG] ✓ Device has acceptable signal strength (RSSI: %s dBm), proceeding with connection",
-                                device_rssi
-                            )
-                            device = scanned_device
-                            break
-
-                # If we found a device, stop scanning (either with good RSSI or RSSI N/A)
-                if device is not None:
-                    break
-
-                # If this isn't the last attempt, wait before next scan
-                if scan_attempt < max_scan_attempts:
-                    wait_time = 2.0 * scan_attempt  # Exponential backoff
                     _LOGGER.info(
-                        "[DIAG] Device not found with valid signal, waiting %.1f seconds before next scan...",
+                        "[DIAG] ✓ Found device %s (Name: %s, RSSI: %s dBm)",
+                        self.mac_address,
+                        device.name or "Unknown",
+                        device_rssi if device_rssi is not None else "N/A"
+                    )
+
+                    # Validate RSSI if available
+                    if device_rssi is None:
+                        # RSSI not available - device might be stale in cache
+                        _LOGGER.warning(
+                            "[DIAG] ⚠ Device found but RSSI is N/A (stale cache?). "
+                            "Waiting for fresh scan data..."
+                        )
+                        device = None  # Clear and retry
+                    elif device_rssi < min_rssi_threshold:
+                        _LOGGER.warning(
+                            "[DIAG] ⚠ Device signal too weak (RSSI: %s dBm < %s dBm threshold). "
+                            "Device may be out of range.",
+                            device_rssi, min_rssi_threshold
+                        )
+                        device = None  # Clear and retry
+                    else:
+                        # Good signal found!
+                        _LOGGER.info(
+                            "[DIAG] ✓ Device has acceptable signal (RSSI: %s dBm >= %s dBm), proceeding",
+                            device_rssi, min_rssi_threshold
+                        )
+                        break  # Found good device, exit loop
+                else:
+                    _LOGGER.info(
+                        "[DIAG] Device %s not found in Home Assistant's Bluetooth cache",
+                        self.mac_address
+                    )
+
+                # If this isn't the last attempt, wait for fresh scan data
+                if attempt < max_lookup_attempts and device is None:
+                    wait_time = 2.0 * attempt  # Exponential backoff: 2s, 4s, 6s
+                    _LOGGER.info(
+                        "[DIAG] Waiting %.1f seconds for fresh BLE scan data...",
                         wait_time
                     )
                     await asyncio.sleep(wait_time)
 
-            except Exception as scan_err:
+            except Exception as lookup_err:
                 _LOGGER.warning(
-                    "[DIAG] Error during BLE scan attempt %d/%d: %s",
-                    scan_attempt, max_scan_attempts, scan_err,
+                    "[DIAG] Error during device lookup attempt %d/%d: %s",
+                    attempt, max_lookup_attempts, lookup_err,
                     exc_info=True
                 )
 
-                if scan_attempt < max_scan_attempts:
+                if attempt < max_lookup_attempts:
                     await asyncio.sleep(2.0)
 
         # Check if we found a suitable device
         if not device:
             _LOGGER.error(
-                "[DIAG] ✗ Device %s not found after %d scan attempts",
-                self.mac_address, max_scan_attempts
+                "[DIAG] ✗ Device %s not found with valid signal after %d attempts",
+                self.mac_address, max_lookup_attempts
             )
             raise BleakError(
-                f"Device not found: {self.mac_address}. "
+                f"Device not found with valid signal: {self.mac_address}. "
                 "Make sure device is powered on, nearby, and not obstructed."
             )
 
