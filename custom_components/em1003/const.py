@@ -101,8 +101,8 @@ SENSOR_TYPES = {
         "key": "tvoc",
         "icon": "mdi:molecule",
         "device_class": "volatile_organic_compounds",
-        "unit": "mg/m³",
-        "note": "Confirmed: Total Volatile Organic Compounds (special encoding: raw × 0.001)",
+        "unit": "µg/m³",
+        "note": "Confirmed: Total Volatile Organic Compounds (raw value is µg/m³)",
     },
     SENSOR_ID_13: {
         "id": SENSOR_ID_13,

@@ -488,9 +488,10 @@ class EM1003Device:
                     self.sensor_data[sensor_id] = (raw_value - 16384) / 1000.0
                     _LOGGER.debug("[RESP] Formaldehyde formula: (%d - 16384) / 1000 = %.3f mg/m³", raw_value, self.sensor_data[sensor_id])
                 elif sensor_id == 0x12:
-                    # TVOC: raw × 0.001
-                    self.sensor_data[sensor_id] = raw_value * 0.001
-                    _LOGGER.debug("[RESP] TVOC formula: %d × 0.001 = %.3f mg/m³", raw_value, self.sensor_data[sensor_id])
+                    # TVOC: raw value is directly in µg/m³
+                    # Device returns: raw * 0.001 mg/m³, which equals raw * 0.001 * 1000 = raw µg/m³
+                    self.sensor_data[sensor_id] = raw_value
+                    _LOGGER.debug("[RESP] TVOC: %d µg/m³ (no conversion needed)", raw_value)
                 else:
                     # Other sensors use raw value directly (PM2.5, PM10, Noise, eCO2)
                     self.sensor_data[sensor_id] = raw_value

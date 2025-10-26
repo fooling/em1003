@@ -174,9 +174,7 @@ class EM1003Sensor(CoordinatorEntity, SensorEntity):
             self._attr_suggested_display_precision = 1
         elif sensor_id == 0x0A:  # Formaldehyde
             self._attr_suggested_display_precision = 3
-        elif sensor_id == 0x12:  # TVOC
-            self._attr_suggested_display_precision = 3
-        else:  # Other sensors (no decimals)
+        else:  # Other sensors (no decimals): PM2.5, PM10, Noise, TVOC, eCO2
             self._attr_suggested_display_precision = 0
 
         # Cache for last valid value and timestamp
