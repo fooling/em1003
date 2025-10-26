@@ -126,29 +126,139 @@ class EM1003Device:
         Raises:
             BleakError: If connection fails after retries
         """
+        _LOGGER.debug(
+            "[DIAG] Starting connection attempt to %s",
+            self.mac_address
+        )
+
         # Wait if we recently disconnected to avoid connection abort errors
         await self._ensure_connection_delay()
 
         # Get a fresh device reference to ensure we have the latest advertising data
+        _LOGGER.debug(
+            "[DIAG] Looking for device %s in Bluetooth cache...",
+            self.mac_address
+        )
         device = bluetooth.async_ble_device_from_address(
             self.hass, self.mac_address, connectable=True
         )
 
+        if device:
+            _LOGGER.debug(
+                "[DIAG] Device %s found in cache (RSSI: %s)",
+                self.mac_address,
+                getattr(device, 'rssi', 'N/A')
+            )
+        else:
+            _LOGGER.info(
+                "[DIAG] Device %s not in cache, performing active BLE scan...",
+                self.mac_address
+            )
+
+            try:
+                # Perform active scan to discover the device
+                scan_start = time.time()
+                devices = await BleakScanner.discover(timeout=10.0)
+                scan_duration = time.time() - scan_start
+
+                _LOGGER.debug(
+                    "[DIAG] BLE scan completed in %.2f seconds, found %d devices",
+                    scan_duration,
+                    len(devices)
+                )
+
+                found = False
+                for scanned_device in devices:
+                    _LOGGER.debug(
+                        "[DIAG] Scanned device: %s (%s) RSSI: %s",
+                        scanned_device.address,
+                        scanned_device.name or "Unknown",
+                        scanned_device.rssi
+                    )
+                    if scanned_device.address.upper() == self.mac_address.upper():
+                        _LOGGER.info(
+                            "[DIAG] ✓ Found target device %s during scan (Name: %s, RSSI: %s)",
+                            self.mac_address,
+                            scanned_device.name or "Unknown",
+                            scanned_device.rssi
+                        )
+                        found = True
+                        break
+
+                if not found:
+                    _LOGGER.warning(
+                        "[DIAG] ✗ Device %s not found during scan. Scanned %d devices.",
+                        self.mac_address,
+                        len(devices)
+                    )
+
+                # Try to get device from cache again after scan
+                # The scan should have populated the cache
+                _LOGGER.debug(
+                    "[DIAG] Waiting 0.5s for cache update, then checking cache again..."
+                )
+                await asyncio.sleep(0.5)  # Small delay for cache update
+                device = bluetooth.async_ble_device_from_address(
+                    self.hass, self.mac_address, connectable=True
+                )
+
+                if device:
+                    _LOGGER.info(
+                        "[DIAG] ✓ Device %s now available in cache after scan",
+                        self.mac_address
+                    )
+                else:
+                    _LOGGER.warning(
+                        "[DIAG] ✗ Device %s still not in cache after scan",
+                        self.mac_address
+                    )
+
+            except Exception as scan_err:
+                _LOGGER.warning(
+                    "[DIAG] Error during BLE scan for %s: %s",
+                    self.mac_address,
+                    scan_err,
+                    exc_info=True
+                )
+
         if not device:
+            _LOGGER.error(
+                "[DIAG] ✗ Device %s not found after all attempts",
+                self.mac_address
+            )
             raise BleakError(f"Device not found: {self.mac_address}")
 
         # Establish connection with timeout and retry logic
         # Use a longer timeout and more attempts to handle flaky connections
-        client = await establish_connection(
-            BleakClient,
-            device,
-            self.mac_address,
-            disconnected_callback=lambda _: None,
-            max_attempts=5,
-            timeout=30.0,  # 30 second timeout per attempt
+        _LOGGER.debug(
+            "[DIAG] Attempting to establish connection to %s using bleak-retry-connector...",
+            self.mac_address
         )
 
-        return client
+        try:
+            client = await establish_connection(
+                BleakClient,
+                device,
+                self.mac_address,
+                disconnected_callback=lambda _: None,
+                max_attempts=5,
+                timeout=30.0,  # 30 second timeout per attempt
+            )
+
+            _LOGGER.info(
+                "[DIAG] ✓ Successfully connected to %s",
+                self.mac_address
+            )
+            return client
+
+        except Exception as conn_err:
+            _LOGGER.error(
+                "[DIAG] ✗ Failed to connect to %s: %s",
+                self.mac_address,
+                conn_err,
+                exc_info=True
+            )
+            raise
 
     def _notification_handler(self, sender, data: bytearray) -> None:
         """Handle notification from device."""
@@ -266,31 +376,46 @@ class EM1003Device:
         Returns:
             Dictionary mapping sensor IDs to their values
         """
+        _LOGGER.debug("[DIAG] read_all_sensors called for %s", self.mac_address)
         results = {}
 
         # Use lock to prevent concurrent connection attempts
+        _LOGGER.debug("[DIAG] Acquiring connection lock for %s", self.mac_address)
         async with self._connection_lock:
+            _LOGGER.debug("[DIAG] Connection lock acquired for %s", self.mac_address)
             try:
                 # Establish connection with improved error handling
+                _LOGGER.debug("[DIAG] Calling _establish_connection for %s", self.mac_address)
                 client = await self._establish_connection()
 
                 try:
-                    _LOGGER.debug("Connected to device %s for reading all sensors", self.mac_address)
+                    _LOGGER.info(
+                        "[DIAG] Connected to device %s, starting sensor reads",
+                        self.mac_address
+                    )
 
                     # Subscribe to notifications once
+                    _LOGGER.debug("[DIAG] Subscribing to notifications...")
                     await client.start_notify(EM1003_NOTIFY_CHAR_UUID, self._notification_handler)
-                    _LOGGER.debug("Subscribed to notifications")
+                    _LOGGER.debug("[DIAG] ✓ Subscribed to notifications")
 
                     # Read all sensors using the same connection
-                    for sensor_id in SENSOR_TYPES.keys():
+                    sensor_count = len(SENSOR_TYPES)
+                    _LOGGER.debug(
+                        "[DIAG] Reading %d sensors: %s",
+                        sensor_count,
+                        [f"0x{sid:02x}" for sid in SENSOR_TYPES.keys()]
+                    )
+
+                    for idx, sensor_id in enumerate(SENSOR_TYPES.keys(), 1):
                         try:
                             # Prepare request
                             seq_id = self._get_next_sequence_id()
                             request = bytes([seq_id, CMD_READ_SENSOR, sensor_id])
 
                             _LOGGER.debug(
-                                "Sending request to sensor %02x: %s",
-                                sensor_id, request.hex()
+                                "[DIAG] [%d/%d] Sending request to sensor 0x%02x: %s",
+                                idx, sensor_count, sensor_id, request.hex()
                             )
 
                             # Create future for response
@@ -303,31 +428,58 @@ class EM1003Device:
                             try:
                                 await asyncio.wait_for(self._notify_future, timeout=5.0)
                                 # Get parsed value
-                                results[sensor_id] = self.sensor_data.get(sensor_id)
+                                value = self.sensor_data.get(sensor_id)
+                                results[sensor_id] = value
+                                _LOGGER.debug(
+                                    "[DIAG] [%d/%d] ✓ Sensor 0x%02x = %s",
+                                    idx, sensor_count, sensor_id, value
+                                )
                             except asyncio.TimeoutError:
-                                _LOGGER.warning("Timeout waiting for sensor %02x response", sensor_id)
+                                _LOGGER.warning(
+                                    "[DIAG] [%d/%d] ✗ Timeout waiting for sensor 0x%02x response",
+                                    idx, sensor_count, sensor_id
+                                )
                                 results[sensor_id] = None
 
                             # Small delay between sensor reads
                             await asyncio.sleep(0.3)
 
                         except Exception as err:
-                            _LOGGER.error("Error reading sensor %02x: %s", sensor_id, err)
+                            _LOGGER.error(
+                                "[DIAG] [%d/%d] ✗ Error reading sensor 0x%02x: %s",
+                                idx, sensor_count, sensor_id, err
+                            )
                             results[sensor_id] = None
 
                     # Stop notifications
+                    _LOGGER.debug("[DIAG] Stopping notifications...")
                     await client.stop_notify(EM1003_NOTIFY_CHAR_UUID)
+                    _LOGGER.debug("[DIAG] ✓ Notifications stopped")
+
+                    _LOGGER.info(
+                        "[DIAG] Completed reading all sensors. Success: %d/%d",
+                        sum(1 for v in results.values() if v is not None),
+                        len(results)
+                    )
 
                 finally:
+                    _LOGGER.debug("[DIAG] Disconnecting from %s...", self.mac_address)
                     await client.disconnect()
                     self._last_disconnect_time = time.time()
-                    _LOGGER.debug("Disconnected from device %s", self.mac_address)
+                    _LOGGER.debug("[DIAG] ✓ Disconnected from device %s", self.mac_address)
 
             except BleakError as err:
-                _LOGGER.error("Bleak error reading all sensors: %s - %s", self.mac_address, err)
+                _LOGGER.error(
+                    "[DIAG] ✗ Bleak error reading all sensors from %s: %s",
+                    self.mac_address, err
+                )
             except Exception as err:
-                _LOGGER.error("Error reading all sensors: %s", err, exc_info=True)
+                _LOGGER.error(
+                    "[DIAG] ✗ Error reading all sensors from %s: %s",
+                    self.mac_address, err, exc_info=True
+                )
 
+        _LOGGER.debug("[DIAG] Released connection lock for %s", self.mac_address)
         return results
 
 
