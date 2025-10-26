@@ -624,9 +624,11 @@ class EM1003Device:
             sensor_info = SENSOR_TYPES.get(sensor_id, {})
             sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
 
+            # Format: (设备响应)[0x seq-cmd-sensor-value...] 实体XX 传感器名
+            hex_parts = ' '.join([f'{b:02x}' for b in data])
             _LOGGER.debug(
-                "[RX] %s ← Raw: %s | Parsed: seq_id=0x%02x, cmd=0x%02x, sensor_id=0x%02x, value_bytes=%s",
-                sensor_name, data.hex(), seq_id, cmd_type, sensor_id, value_bytes.hex()
+                "[RX] (设备响应)[0x %s] 实体%02x %s",
+                hex_parts, sensor_id, sensor_name
             )
 
 
@@ -672,9 +674,11 @@ class EM1003Device:
                 unit = sensor_info.get("unit", "")
                 final_value = self.sensor_data.get(sensor_id)
 
+                # Format: 解析: 字节XX → 原始值N → 公式[...] → 最终值V 单位
+                value_hex = ' '.join([f'{b:02x}' for b in value_bytes[:2]])
                 _LOGGER.debug(
-                    "[RX] %s: value_bytes=%s → raw=%d → formula=[%s] → final=%s %s",
-                    sensor_name, value_bytes[:2].hex(), raw_value, formula_desc, final_value, unit
+                    "[RX] 解析: 字节[%s] → 原始值%d → 公式[%s] → 最终值%s %s",
+                    value_hex, raw_value, formula_desc, final_value, unit
                 )
 
                 _LOGGER.info(
@@ -731,9 +735,15 @@ class EM1003Device:
             seq_id = self._get_random_sequence_id()
             request = bytes([seq_id, CMD_READ_SENSOR, sensor_id])
 
+            # Get sensor name for logging
+            sensor_info = SENSOR_TYPES.get(sensor_id, {})
+            sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
+
+            # Format: (请求传感器数据)[0x seq-cmd-sensor] 实体XX 传感器名
+            hex_parts = ' '.join([f'{b:02x}' for b in request])
             _LOGGER.debug(
-                "[TX] Sending request → Raw: %s | Parsed: seq_id=0x%02x, cmd=0x%02x(READ), sensor_id=0x%02x",
-                request.hex(), seq_id, CMD_READ_SENSOR, sensor_id
+                "[TX] (请求传感器数据)[0x %s] 实体%02x %s",
+                hex_parts, sensor_id, sensor_name
             )
 
             # Create pending request and add to cache
@@ -857,9 +867,11 @@ class EM1003Device:
                             sensor_name, sensor_id, seq_id
                         )
 
+                    # Format: (请求传感器数据)[0x seq-cmd-sensor] 实体XX 传感器名
+                    hex_parts = ' '.join([f'{b:02x}' for b in request])
                     _LOGGER.debug(
-                        "[TX] [%d/%d] %s → Raw: %s | Parsed: seq_id=0x%02x, cmd=0x%02x(READ), sensor_id=0x%02x",
-                        idx, sensor_count, sensor_name, request.hex(), seq_id, CMD_READ_SENSOR, sensor_id
+                        "[TX] [%d/%d] (请求传感器数据)[0x %s] 实体%02x %s",
+                        idx, sensor_count, hex_parts, sensor_id, sensor_name
                     )
 
                     # Create pending request and add to cache
