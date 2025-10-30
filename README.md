@@ -91,17 +91,14 @@ ESP32 (Bluetooth Proxy)
    - ESP32 开发板（推荐 ESP32-C3、ESP32 Supermini 等）
    - USB 数据线
 
-2. **一键刷入固件**
+2. **一键刷入固件并配置 WiFi**
    - 访问 ESPHome 官方项目页面：**https://esphome.io/projects/**
    - 找到 **"Bluetooth Proxy"** 项目
    - 选择你的 ESP32 型号，点击 **"Install"** 按钮
-   - 按照网页提示连接 USB 并刷入固件（全程自动化）
+   - 按照网页提示连接 USB 并刷入固件
+   - **刷入过程中会自动弹出 WiFi 配置界面**，直接输入你的家庭 WiFi 信息即可
 
-3. **配置 WiFi**
-   - 刷入成功后，ESP32 会创建一个 WiFi 热点
-   - 用手机连接该热点，输入你的家庭 WiFi 信息
-
-4. **自动集成**
+3. **自动集成**
    - Home Assistant 会自动发现蓝牙代理设备
    - 在 **设置 > 设备与服务** 中确认添加
    - 所有在 ESP32 范围内的 EM1003 设备将自动被发现
@@ -201,17 +198,14 @@ ESP32 (Bluetooth Proxy)
    - ESP32 development board (ESP32-C3, ESP32 Supermini, etc.)
    - USB cable
 
-2. **One-Click Firmware Flash**
+2. **One-Click Firmware Flash & WiFi Setup**
    - Visit ESPHome official projects page: **https://esphome.io/projects/**
    - Find the **"Bluetooth Proxy"** project
    - Select your ESP32 model, click **"Install"** button
-   - Follow on-screen prompts to connect USB and flash firmware (fully automated)
+   - Follow on-screen prompts to connect USB and flash firmware
+   - **WiFi configuration interface will automatically appear during flashing** - simply enter your home WiFi credentials
 
-3. **Configure WiFi**
-   - After flashing, ESP32 creates a WiFi hotspot
-   - Connect with your phone and enter your home WiFi credentials
-
-4. **Automatic Integration**
+3. **Automatic Integration**
    - Home Assistant will auto-discover the Bluetooth proxy
    - Confirm addition in **Settings > Devices & Services**
    - All EM1003 devices within ESP32 range will be automatically discovered
