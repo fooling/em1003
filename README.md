@@ -14,12 +14,21 @@
 
 #### 通过 HACS 安装（推荐）
 
-1. 打开 HACS > 集成 > 右上角菜单 > 自定义存储库
-2. 添加仓库：`https://github.com/yourusername/em1003`，类别选择 `Integration`
-3. 搜索"EM1003 BLE Sensor"并下载
-4. 重启 Home Assistant
-5. 进入 设置 > 设备与服务 > 添加集成 > 搜索"EM1003"
-6. 输入设备的 MAC 地址（如 `AA:BB:CC:DD:EE:FF`）
+> **注意**：此项目尚未加入HACS官方存储库，需要手动添加自定义存储库。
+
+1. 在 Home Assistant 中打开 **HACS**
+2. 点击右上角 **⋮** 菜单，选择 **自定义存储库**
+3. 在弹出窗口中填写：
+   - **存储库地址**：`https://github.com/fooling/em1003`
+   - **类别**：选择 `Integration`（集成）
+   - 点击 **添加**
+4. 关闭对话框后，点击右下角 **+ 浏览并下载存储库** 按钮
+5. 搜索 **"EM1003"**，找到并点击进入
+6. 点击右下角 **下载** 按钮，下载最新版本
+7. **重启 Home Assistant**（必须重启才能加载集成）
+8. 重启后，进入 **设置 > 设备与服务 > 添加集成**
+9. 搜索 **"EM1003"**，点击添加
+10. 输入你的环境宝设备 MAC 地址（格式：`AA:BB:CC:DD:EE:FF`）
 
 #### 手动安装
 
@@ -134,12 +143,21 @@ A Home Assistant custom integration for the **EM1003 BLE Sensor** (720 Air Quali
 
 #### Install via HACS (Recommended)
 
-1. HACS > Integrations > Menu (top right) > Custom repositories
-2. Add: `https://github.com/yourusername/em1003`, Category: `Integration`
-3. Search "EM1003 BLE Sensor" and download
-4. Restart Home Assistant
-5. Settings > Devices & Services > Add Integration > "EM1003"
-6. Enter device MAC address (e.g., `AA:BB:CC:DD:EE:FF`)
+> **Note**: This project is not yet in the official HACS repository. You need to manually add it as a custom repository.
+
+1. Open **HACS** in Home Assistant
+2. Click the **⋮** menu (top right), select **Custom repositories**
+3. In the popup dialog, fill in:
+   - **Repository URL**: `https://github.com/fooling/em1003`
+   - **Category**: Select `Integration`
+   - Click **Add**
+4. Close the dialog, then click **+ Explore & Download Repositories** button (bottom right)
+5. Search for **"EM1003"** and select it
+6. Click **Download** button (bottom right) to download the latest version
+7. **Restart Home Assistant** (required to load the integration)
+8. After restart, go to **Settings > Devices & Services > Add Integration**
+9. Search for **"EM1003"** and add it
+10. Enter your device's MAC address (format: `AA:BB:CC:DD:EE:FF`)
 
 #### Manual Installation
 
