@@ -28,7 +28,7 @@
 7. **重启 Home Assistant**（必须重启才能加载集成）
 8. 重启后，进入 **设置 > 设备与服务 > 添加集成**
 9. 搜索 **"EM1003"**，点击添加
-10. 输入你的环境宝设备 MAC 地址（格式：`AA:BB:CC:DD:EE:FF`）
+10. 从下拉框中选择已扫描到的环境宝设备（系统会自动扫描附近的蓝牙设备）
 
 #### 手动安装
 
@@ -138,7 +138,7 @@ A Home Assistant custom integration for the **EM1003 BLE Sensor** (720 Air Quali
 7. **Restart Home Assistant** (required to load the integration)
 8. After restart, go to **Settings > Devices & Services > Add Integration**
 9. Search for **"EM1003"** and add it
-10. Enter your device's MAC address (format: `AA:BB:CC:DD:EE:FF`)
+10. Select your EM1003 device from the dropdown list (system will auto-scan nearby Bluetooth devices)
 
 #### Manual Installation
 
