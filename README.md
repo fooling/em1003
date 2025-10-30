@@ -72,64 +72,45 @@
 
 完整协议文档：[docs/protocol_reverse_engineering.md](docs/protocol_reverse_engineering.md)
 
-### 3. 高级用法：ESP32 蓝牙网关
+### 3. 高级用法：ESP32 蓝牙代理扩展范围
 
 #### 应用场景
-Home Assistant 主机蓝牙信号覆盖不足时，使用 ESP32 Supermini 作为远程蓝牙网关，通过 ESPHome 连接多个环境宝。
+当 Home Assistant 主机蓝牙信号覆盖范围不足时，可使用 ESP32 设备作为蓝牙代理，扩展蓝牙覆盖范围，连接更远距离的环境宝设备。
 
-#### 核心逻辑
+#### 工作原理
 ```
-ESP32 Supermini (ESPHome)
-  ├─ 蓝牙扫描多个 EM1003 设备
-  ├─ 建立 BLE 连接（最多支持3个同时连接）
-  ├─ 轮询读取各设备传感器数据
-  └─ 通过 WiFi 上报到 Home Assistant
-```
-
-#### 快速步骤
-
-1. **准备硬件**：ESP32 Supermini + USB 数据线
-
-2. **安装 ESPHome**：在 Home Assistant 中安装 ESPHome 集成
-
-3. **创建设备配置** `em1003-gateway.yaml`：
-```yaml
-esphome:
-  name: em1003-gateway
-
-esp32:
-  board: esp32dev
-
-wifi:
-  ssid: "你的WiFi"
-  password: "WiFi密码"
-
-api:
-  encryption:
-    key: "自动生成的密钥"
-
-ota:
-
-esp32_ble_tracker:
-  scan_parameters:
-    active: true
-
-# 配置多个 EM1003 设备（替换为你的 MAC 地址）
-sensor:
-  - platform: ble_client
-    ble_client_id: em1003_1
-    # 温度、湿度等传感器配置
-    # 具体配置参考 ESPHome BLE Client 文档
+ESP32 (Bluetooth Proxy)
+  ├─ 扫描附近的 BLE 设备（包括 EM1003）
+  ├─ 透明转发蓝牙数据
+  └─ 通过 WiFi 传输到 Home Assistant
 ```
 
-4. **烧录固件**：ESPHome > 编译并上传到 ESP32
+#### 极简安装步骤
 
-5. **自动发现**：Home Assistant 会自动发现网关设备及所有传感器
+1. **准备硬件**
+   - ESP32 开发板（推荐 ESP32-C3、ESP32 Supermini 等）
+   - USB 数据线
 
-#### 注意事项
-- ESP32 建议同时连接 ≤3 个设备，避免连接槽耗尽
-- 设备需在 ESP32 蓝牙范围内（约10米）
-- 传感器更新间隔建议 ≥30秒，减少电池消耗
+2. **一键刷入固件**
+   - 访问 ESPHome 官方项目页面：**https://esphome.io/projects/**
+   - 找到 **"Bluetooth Proxy"** 项目
+   - 选择你的 ESP32 型号，点击 **"Install"** 按钮
+   - 按照网页提示连接 USB 并刷入固件（全程自动化）
+
+3. **配置 WiFi**
+   - 刷入成功后，ESP32 会创建一个 WiFi 热点
+   - 用手机连接该热点，输入你的家庭 WiFi 信息
+
+4. **自动集成**
+   - Home Assistant 会自动发现蓝牙代理设备
+   - 在 **设置 > 设备与服务** 中确认添加
+   - 所有在 ESP32 范围内的 EM1003 设备将自动被发现
+
+#### 优势
+- ✅ **无需编写代码**：官方预编译固件，点击即刷
+- ✅ **即插即用**：自动发现，零配置
+- ✅ **扩展范围**：将蓝牙覆盖扩展到 ESP32 周围 10 米范围
+- ✅ **多设备支持**：一个代理可扫描多个 BLE 设备
 
 ---
 
@@ -201,64 +182,45 @@ Example: AC 06 08 31 00  → Noise = 0x31 + (0x00 × 256) = 49 dB
 
 Full protocol documentation: [docs/protocol_reverse_engineering.md](docs/protocol_reverse_engineering.md)
 
-### 3. Advanced Usage: ESP32 Bluetooth Gateway
+### 3. Advanced Usage: ESP32 Bluetooth Proxy Range Extender
 
 #### Use Case
-When Home Assistant's Bluetooth range is insufficient, use an ESP32 Supermini as a remote BLE gateway to connect multiple EM1003 devices via ESPHome.
+When your Home Assistant host's Bluetooth range is insufficient, use an ESP32 device as a Bluetooth proxy to extend coverage and reach distant EM1003 sensors.
 
-#### Core Logic
+#### How It Works
 ```
-ESP32 Supermini (ESPHome)
-  ├─ Scan multiple EM1003 devices
-  ├─ Establish BLE connections (max 3 concurrent)
-  ├─ Poll sensor data from each device
-  └─ Report to Home Assistant via WiFi
-```
-
-#### Quick Setup
-
-1. **Hardware**: ESP32 Supermini + USB cable
-
-2. **Install ESPHome**: Add ESPHome integration in Home Assistant
-
-3. **Create device config** `em1003-gateway.yaml`:
-```yaml
-esphome:
-  name: em1003-gateway
-
-esp32:
-  board: esp32dev
-
-wifi:
-  ssid: "YourWiFi"
-  password: "WiFiPassword"
-
-api:
-  encryption:
-    key: "auto-generated-key"
-
-ota:
-
-esp32_ble_tracker:
-  scan_parameters:
-    active: true
-
-# Configure multiple EM1003 devices (replace with your MAC addresses)
-sensor:
-  - platform: ble_client
-    ble_client_id: em1003_1
-    # Temperature, humidity sensor configs
-    # Refer to ESPHome BLE Client documentation
+ESP32 (Bluetooth Proxy)
+  ├─ Scans nearby BLE devices (including EM1003)
+  ├─ Transparently forwards Bluetooth data
+  └─ Transmits to Home Assistant via WiFi
 ```
 
-4. **Flash firmware**: ESPHome > Compile and upload to ESP32
+#### Simple Installation Steps
 
-5. **Auto-discovery**: Home Assistant will automatically discover the gateway and all sensors
+1. **Prepare Hardware**
+   - ESP32 development board (ESP32-C3, ESP32 Supermini, etc.)
+   - USB cable
 
-#### Important Notes
-- Recommend ≤3 concurrent connections to avoid ESP32 connection slot exhaustion
-- Devices must be within ESP32 BLE range (~10 meters)
-- Sensor update interval ≥30 seconds recommended to reduce battery drain
+2. **One-Click Firmware Flash**
+   - Visit ESPHome official projects page: **https://esphome.io/projects/**
+   - Find the **"Bluetooth Proxy"** project
+   - Select your ESP32 model, click **"Install"** button
+   - Follow on-screen prompts to connect USB and flash firmware (fully automated)
+
+3. **Configure WiFi**
+   - After flashing, ESP32 creates a WiFi hotspot
+   - Connect with your phone and enter your home WiFi credentials
+
+4. **Automatic Integration**
+   - Home Assistant will auto-discover the Bluetooth proxy
+   - Confirm addition in **Settings > Devices & Services**
+   - All EM1003 devices within ESP32 range will be automatically discovered
+
+#### Benefits
+- ✅ **No Coding Required**: Official pre-compiled firmware, click to flash
+- ✅ **Plug & Play**: Auto-discovery, zero configuration
+- ✅ **Extended Range**: Expands Bluetooth coverage to ~10 meters around ESP32
+- ✅ **Multi-Device Support**: One proxy can scan multiple BLE devices
 
 ---
 
