@@ -46,6 +46,9 @@ async def async_setup_entry(
     # Create coordinator for updating sensor data
     coordinator = EM1003DataUpdateCoordinator(hass, em1003_device, mac_address, scan_interval)
 
+    # Store coordinator in hass.data so switch can access it
+    hass.data[DOMAIN][config_entry.entry_id]["coordinator"] = coordinator
+
     # Add a small delay before first refresh to allow device to be ready
     _LOGGER.debug("Waiting for device to be ready before initial refresh...")
     await asyncio.sleep(2.0)
@@ -103,6 +106,17 @@ class EM1003DataUpdateCoordinator(DataUpdateCoordinator):
         try:
             _LOGGER.debug("Updating sensor data for %s", self.mac_address)
             data = await self.em1003_device.read_all_sensors()
+
+            # Also update buzzer state periodically to keep switch in sync
+            # This prevents the switch from staying unavailable if state gets out of sync
+            try:
+                _LOGGER.debug("Querying buzzer state for %s", self.mac_address)
+                buzzer_state = await self.em1003_device.read_buzzer_state()
+                if buzzer_state is not None:
+                    _LOGGER.debug("Buzzer state updated: %s", "ON" if buzzer_state else "OFF")
+            except Exception as buzzer_err:
+                _LOGGER.debug("Could not update buzzer state: %s", buzzer_err)
+                # Don't fail the entire update if buzzer query fails
 
             # Check if we actually received any valid data
             valid_count = sum(1 for v in data.values() if v is not None)
