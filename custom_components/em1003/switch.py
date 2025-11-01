@@ -25,6 +25,7 @@ async def async_setup_entry(
     mac_address = data[CONF_MAC_ADDRESS]
     device_name = data.get("device_name", config_entry.title)
     em1003_device = data["device"]
+    coordinator = data.get("coordinator")
 
     _LOGGER.info("Setting up EM1003 buzzer switch for device: %s (%s)", device_name, mac_address)
 
@@ -35,6 +36,7 @@ async def async_setup_entry(
             mac_address,
             device_name,
             em1003_device,
+            coordinator,
         )
     ])
 
@@ -50,12 +52,14 @@ class EM1003BuzzerSwitch(SwitchEntity):
         mac_address: str,
         device_name: str,
         em1003_device,
+        coordinator=None,
     ) -> None:
         """Initialize the buzzer switch."""
         self._config_entry = config_entry
         self._mac_address = mac_address
         self._device_name = device_name
         self._em1003_device = em1003_device
+        self._coordinator = coordinator
 
         # Set entity attributes
         self._attr_unique_id = f"{mac_address}_buzzer"
@@ -65,6 +69,10 @@ class EM1003BuzzerSwitch(SwitchEntity):
         # State tracking
         self._attr_is_on = None
         self._attr_available = True
+
+        # Subscribe to coordinator updates if available
+        if self._coordinator:
+            self._coordinator_listener = None
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -80,6 +88,12 @@ class EM1003BuzzerSwitch(SwitchEntity):
     async def async_added_to_hass(self) -> None:
         """Run when entity about to be added to hass."""
         await super().async_added_to_hass()
+
+        # Subscribe to coordinator updates
+        if self._coordinator:
+            self._coordinator_listener = self._coordinator.async_add_listener(
+                self._handle_coordinator_update
+            )
 
         # Try to read initial buzzer state
         try:
@@ -105,6 +119,27 @@ class EM1003BuzzerSwitch(SwitchEntity):
                 err
             )
             self._attr_is_on = None
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Run when entity will be removed from hass."""
+        if self._coordinator_listener:
+            self._coordinator_listener()
+            self._coordinator_listener = None
+
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        # Sync state from device object (updated by coordinator's buzzer query)
+        if self._em1003_device.buzzer_state is not None:
+            if self._attr_is_on != self._em1003_device.buzzer_state:
+                _LOGGER.debug(
+                    "Syncing buzzer state from coordinator for %s: %s -> %s",
+                    self._mac_address,
+                    "ON" if self._attr_is_on else "OFF" if self._attr_is_on is not None else "Unknown",
+                    "ON" if self._em1003_device.buzzer_state else "OFF"
+                )
+                self._attr_is_on = self._em1003_device.buzzer_state
+                self._attr_available = True
+                self.async_write_ha_state()
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the buzzer on."""

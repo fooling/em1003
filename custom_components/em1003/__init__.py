@@ -100,8 +100,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.warning("Could not read device name, using default: %s", entry.title)
         device_name = entry.title
 
-    # Create EM1003 device instance
-    em1003_device = EM1003Device(hass, mac_address)
+    # Create EM1003 device instance with device name
+    em1003_device = EM1003Device(hass, mac_address, device_name)
 
     # Register device in device registry before creating entities
     device_registry = dr.async_get(hass)

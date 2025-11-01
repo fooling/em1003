@@ -152,10 +152,11 @@ class CircuitBreaker:
 class EM1003Device:
     """Representation of an EM1003 BLE device."""
 
-    def __init__(self, hass: HomeAssistant, mac_address: str) -> None:
+    def __init__(self, hass: HomeAssistant, mac_address: str, device_name: str | None = None) -> None:
         """Initialize the device."""
         self.hass = hass
         self.mac_address = mac_address
+        self.device_name = device_name or mac_address  # Use MAC as fallback
         self._client: BleakClient | None = None
         self.sensor_data: dict[int, float | None] = {}
         self.buzzer_state: bool | None = None  # Buzzer state (True=on, False=off, None=unknown)
@@ -179,6 +180,12 @@ class EM1003Device:
         # Track last connection failure for fast-fail behavior
         self._last_connection_failure_time: float | None = None
         self._fast_fail_window = 30.0  # Seconds to fast-fail after connection failure
+
+    def _device_id(self) -> str:
+        """Get device identifier for logging."""
+        if self.device_name and self.device_name != self.mac_address:
+            return f"{self.device_name} ({self.mac_address})"
+        return self.mac_address
 
     def _get_random_sequence_id(self) -> int:
         """Get a random unused sequence ID.
@@ -299,7 +306,7 @@ class EM1003Device:
         # Get device from Home Assistant's Bluetooth integration
         _LOGGER.info(
             "[DIAG] Getting device %s from Home Assistant Bluetooth integration...",
-            self.mac_address
+            self._device_id()
         )
 
         device = bluetooth.async_ble_device_from_address(
@@ -311,7 +318,7 @@ class EM1003Device:
         if not device:
             _LOGGER.error(
                 "[DIAG] ✗ Device %s not found",
-                self.mac_address
+                self._device_id()
             )
             raise BleakError(
                 f"Device not found: {self.mac_address}. "
@@ -538,10 +545,9 @@ class EM1003Device:
         # Fast-fail if we recently failed to connect (unless circuit breaker is testing)
         if self._last_connection_failure_time is not None:
             time_since_failure = time.time() - self._last_connection_failure_time
-            circuit_state = self._circuit_breaker.get_state_info()
 
             # Only fast-fail if we're not in HALF_OPEN state (testing phase)
-            if time_since_failure < self._fast_fail_window and circuit_state.get("state") != "HALF_OPEN":
+            if time_since_failure < self._fast_fail_window and self._circuit_breaker.state != "HALF_OPEN":
                 remaining = self._fast_fail_window - time_since_failure
                 _LOGGER.debug(
                     "[CONN] Fast-fail: Recent connection failure (%.0fs ago), "
@@ -643,8 +649,8 @@ class EM1003Device:
             if cmd_type == CMD_BUZZER:
                 hex_parts = ' '.join([f'{b:02x}' for b in data])
                 _LOGGER.debug(
-                    "[RX] (蜂鸣器响应)[0x %s]",
-                    hex_parts
+                    "[RX] (蜂鸣器响应)[0x %s] len=%d, sensor_id=0x%02x, value_bytes=%s",
+                    hex_parts, len(data), sensor_id, value_bytes.hex() if value_bytes else "empty"
                 )
 
                 # Find matching pending request
@@ -653,12 +659,13 @@ class EM1003Device:
 
                 if not pending_request:
                     _LOGGER.warning(
-                        "[RX] ✗ Buzzer: Unexpected response (seq=0x%02x, no matching request)",
-                        seq_id
+                        "[RX] ✗ Buzzer: Unexpected response (seq=0x%02x, sensor_id=0x%02x, no matching request)",
+                        seq_id, sensor_id
                     )
                     return
 
                 # Parse buzzer state from response
+                # Response format: [seq_id][0x50][0x00][state]
                 if len(value_bytes) >= 1:
                     buzzer_value = value_bytes[0]
                     self.buzzer_state = (buzzer_value == BUZZER_ON)
@@ -668,7 +675,10 @@ class EM1003Device:
                         buzzer_value
                     )
                 else:
-                    _LOGGER.warning("[RX] ✗ Buzzer: Response too short")
+                    _LOGGER.warning(
+                        "[RX] ✗ Buzzer: Response too short (len=%d, expected >= 4 bytes)",
+                        len(data)
+                    )
 
                 # Complete the future
                 if not pending_request.future.done():
@@ -1224,17 +1234,47 @@ class EM1003Device:
             try:
                 await asyncio.wait_for(pending_request.future, timeout=2.0)
 
-                # Verify the state was set correctly
+                # Set command received, now query to verify the actual state
+                # The set response may not contain reliable state info, so we query separately
+                _LOGGER.debug("[BUZZER] Set command acknowledged, querying actual state...")
+
+                # Small delay to allow device to process the command
+                await asyncio.sleep(0.1)
+
+                # Query current state
+                query_seq_id = self._get_random_sequence_id()
+                query_request = bytes([query_seq_id, CMD_BUZZER, 0x00])
+
+                query_hex = ' '.join([f'{b:02x}' for b in query_request])
+                _LOGGER.debug("[TX] (验证蜂鸣器状态)[0x %s]", query_hex)
+
+                # Create pending request for query
+                query_pending = PendingRequest(
+                    seq_id=query_seq_id,
+                    sensor_id=0x00,
+                    future=asyncio.Future(),
+                    timestamp=time.time()
+                )
+                query_key = (query_seq_id, 0x00)
+                self._pending_requests[query_key] = query_pending
+
+                # Send query request
+                await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, query_request, response=False)
+
+                # Wait for query response
+                await asyncio.wait_for(query_pending.future, timeout=2.0)
+
+                # Now verify the state
                 if self.buzzer_state == turn_on:
                     _LOGGER.info(
-                        "[BUZZER] ✓ Successfully %s buzzer",
+                        "[BUZZER] ✓ Successfully %s buzzer (verified)",
                         "turned on" if turn_on else "turned off"
                     )
                     self._circuit_breaker.record_success()
                     return True
                 else:
                     _LOGGER.warning(
-                        "[BUZZER] ✗ State mismatch: expected %s, got %s",
+                        "[BUZZER] ✗ State mismatch after verification: expected %s, got %s",
                         turn_on, self.buzzer_state
                     )
                     self._circuit_breaker.record_failure()
@@ -1242,12 +1282,16 @@ class EM1003Device:
 
             except asyncio.TimeoutError:
                 _LOGGER.warning(
-                    "Timeout waiting for buzzer set response (seq=%02x)",
+                    "Timeout waiting for buzzer response (set seq=%02x)",
                     seq_id
                 )
-                # Clean up pending request
+                # Clean up any pending requests
                 self._pending_requests.pop(request_key, None)
                 self._used_seq_ids.discard(seq_id)
+                # Also clean up query request if it exists
+                if 'query_key' in locals():
+                    self._pending_requests.pop(query_key, None)
+                    self._used_seq_ids.discard(query_seq_id)
                 self._circuit_breaker.record_failure()
                 return False
 
