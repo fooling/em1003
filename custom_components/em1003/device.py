@@ -17,6 +17,7 @@ from homeassistant.core import HomeAssistant
 from .const import (
     CMD_READ_SENSOR,
     CMD_BUZZER,
+    CMD_BUZZER_SET_RESPONSE,
     BUZZER_ON,
     BUZZER_OFF,
     EM1003_NOTIFY_CHAR_UUID,
@@ -645,7 +646,39 @@ class EM1003Device:
             sensor_id = data[2]
             value_bytes = data[3:]
 
-            # Handle buzzer command response
+            # Handle buzzer set response (0x05)
+            if cmd_type == CMD_BUZZER_SET_RESPONSE:
+                hex_parts = ' '.join([f'{b:02x}' for b in data])
+                _LOGGER.debug(
+                    "[RX] (蜂鸣器设置响应)[0x %s] len=%d",
+                    hex_parts, len(data)
+                )
+
+                # Find matching pending request
+                # For set operations, we use sensor_id 0x01
+                request_key = (seq_id, 0x01)
+                pending_request = self._pending_requests.get(request_key)
+
+                if not pending_request:
+                    _LOGGER.warning(
+                        "[RX] ✗ Buzzer set: Unexpected response (seq=0x%02x, no matching request)",
+                        seq_id
+                    )
+                    return
+
+                _LOGGER.info(
+                    "[RESP] ✓ Buzzer set command acknowledged"
+                )
+
+                # Complete the future
+                if not pending_request.future.done():
+                    pending_request.future.set_result(data)
+
+                del self._pending_requests[request_key]
+                self._used_seq_ids.discard(seq_id)
+                return
+
+            # Handle buzzer query response (0x50)
             if cmd_type == CMD_BUZZER:
                 hex_parts = ' '.join([f'{b:02x}' for b in data])
                 _LOGGER.debug(
@@ -1219,10 +1252,10 @@ class EM1003Device:
             client = await self._ensure_connected()
 
             # Prepare request with random sequence ID
-            # Set buzzer state: [seq_id][0x50][0x00][state]
+            # Set buzzer state: [seq_id][0x50][0x01][state]
             seq_id = self._get_random_sequence_id()
             state_byte = BUZZER_ON if turn_on else BUZZER_OFF
-            request = bytes([seq_id, CMD_BUZZER, 0x00, state_byte])
+            request = bytes([seq_id, CMD_BUZZER, 0x01, state_byte])
 
             hex_parts = ' '.join([f'{b:02x}' for b in request])
             _LOGGER.debug(
@@ -1234,11 +1267,11 @@ class EM1003Device:
             # Create pending request and add to cache
             pending_request = PendingRequest(
                 seq_id=seq_id,
-                sensor_id=0x00,  # Use 0x00 as placeholder for buzzer
+                sensor_id=0x01,  # Use 0x01 for buzzer set operation
                 future=asyncio.Future(),
                 timestamp=time.time()
             )
-            request_key = (seq_id, 0x00)
+            request_key = (seq_id, 0x01)
             self._pending_requests[request_key] = pending_request
 
             # Send request
@@ -1300,11 +1333,11 @@ class EM1003Device:
                     seq_id
                 )
                 # Clean up any pending requests
-                self._pending_requests.pop(request_key, None)
+                self._pending_requests.pop((seq_id, 0x01), None)
                 self._used_seq_ids.discard(seq_id)
                 # Also clean up query request if it exists
-                if 'query_key' in locals():
-                    self._pending_requests.pop(query_key, None)
+                if 'query_seq_id' in locals():
+                    self._pending_requests.pop((query_seq_id, 0x00), None)
                     self._used_seq_ids.discard(query_seq_id)
                 self._circuit_breaker.record_failure()
                 return False

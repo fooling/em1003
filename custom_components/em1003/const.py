@@ -29,6 +29,7 @@ EM1003_NOTIFY_CHAR_UUID = "0000FFF4-0000-1000-8000-00805F9B34FB"  # Notify chara
 # Protocol Commands
 CMD_READ_SENSOR = 0x06  # Command to read sensor data
 CMD_BUZZER = 0x50  # Command for buzzer control
+CMD_BUZZER_SET_RESPONSE = 0x05  # Response command for buzzer set operations
 
 # Buzzer states
 BUZZER_OFF = 0x00  # Buzzer off
@@ -129,4 +130,4 @@ DEFAULT_SCAN_INTERVAL = 60  # Default polling interval in seconds
 DEVICE_TIMEOUT = 30.0
 
 # Version
-VERSION = "1.0.2"
+VERSION = "1.0.3"
