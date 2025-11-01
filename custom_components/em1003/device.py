@@ -538,10 +538,9 @@ class EM1003Device:
         # Fast-fail if we recently failed to connect (unless circuit breaker is testing)
         if self._last_connection_failure_time is not None:
             time_since_failure = time.time() - self._last_connection_failure_time
-            circuit_state = self._circuit_breaker.get_state_info()
 
             # Only fast-fail if we're not in HALF_OPEN state (testing phase)
-            if time_since_failure < self._fast_fail_window and circuit_state.get("state") != "HALF_OPEN":
+            if time_since_failure < self._fast_fail_window and self._circuit_breaker.state != "HALF_OPEN":
                 remaining = self._fast_fail_window - time_since_failure
                 _LOGGER.debug(
                     "[CONN] Fast-fail: Recent connection failure (%.0fs ago), "
