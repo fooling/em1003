@@ -16,6 +16,9 @@ from homeassistant.core import HomeAssistant
 
 from .const import (
     CMD_READ_SENSOR,
+    CMD_BUZZER,
+    BUZZER_ON,
+    BUZZER_OFF,
     EM1003_NOTIFY_CHAR_UUID,
     EM1003_WRITE_CHAR_UUID,
     SENSOR_TYPES,
@@ -155,6 +158,7 @@ class EM1003Device:
         self.mac_address = mac_address
         self._client: BleakClient | None = None
         self.sensor_data: dict[int, float | None] = {}
+        self.buzzer_state: bool | None = None  # Buzzer state (True=on, False=off, None=unknown)
         self._last_disconnect_time: float | None = None
 
         # Request cache for matching responses to requests
@@ -635,6 +639,45 @@ class EM1003Device:
             sensor_id = data[2]
             value_bytes = data[3:]
 
+            # Handle buzzer command response
+            if cmd_type == CMD_BUZZER:
+                hex_parts = ' '.join([f'{b:02x}' for b in data])
+                _LOGGER.debug(
+                    "[RX] (蜂鸣器响应)[0x %s]",
+                    hex_parts
+                )
+
+                # Find matching pending request
+                request_key = (seq_id, sensor_id)
+                pending_request = self._pending_requests.get(request_key)
+
+                if not pending_request:
+                    _LOGGER.warning(
+                        "[RX] ✗ Buzzer: Unexpected response (seq=0x%02x, no matching request)",
+                        seq_id
+                    )
+                    return
+
+                # Parse buzzer state from response
+                if len(value_bytes) >= 1:
+                    buzzer_value = value_bytes[0]
+                    self.buzzer_state = (buzzer_value == BUZZER_ON)
+                    _LOGGER.info(
+                        "[RESP] ✓ Buzzer state = %s (0x%02x)",
+                        "ON" if self.buzzer_state else "OFF",
+                        buzzer_value
+                    )
+                else:
+                    _LOGGER.warning("[RX] ✗ Buzzer: Response too short")
+
+                # Complete the future
+                if not pending_request.future.done():
+                    pending_request.future.set_result(data)
+
+                del self._pending_requests[request_key]
+                self._used_seq_ids.discard(seq_id)
+                return
+
             # Get sensor name for logging
             sensor_info = SENSOR_TYPES.get(sensor_id, {})
             sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
@@ -1052,3 +1095,169 @@ class EM1003Device:
                     _LOGGER.debug("[CONN] Error during error-path disconnect: %s", disconnect_err)
                 self._client = None
             raise
+
+    async def read_buzzer_state(self) -> bool | None:
+        """Read current buzzer state.
+
+        Returns:
+            True if buzzer is on, False if off, None if reading fails
+        """
+        # Check circuit breaker
+        can_attempt, reason = self._circuit_breaker.can_attempt()
+        if not can_attempt:
+            _LOGGER.warning(
+                "[CIRCUIT] Blocked read_buzzer_state: %s",
+                reason
+            )
+            return None
+
+        # Clean up expired requests
+        self._cleanup_expired_requests()
+
+        try:
+            # Ensure connection
+            client = await self._ensure_connected()
+
+            # Prepare request with random sequence ID
+            # Query buzzer state: [seq_id][0x50][0x00]
+            seq_id = self._get_random_sequence_id()
+            request = bytes([seq_id, CMD_BUZZER, 0x00])
+
+            hex_parts = ' '.join([f'{b:02x}' for b in request])
+            _LOGGER.debug(
+                "[TX] (查询蜂鸣器状态)[0x %s]",
+                hex_parts
+            )
+
+            # Create pending request and add to cache
+            pending_request = PendingRequest(
+                seq_id=seq_id,
+                sensor_id=0x00,  # Use 0x00 as placeholder for buzzer
+                future=asyncio.Future(),
+                timestamp=time.time()
+            )
+            request_key = (seq_id, 0x00)
+            self._pending_requests[request_key] = pending_request
+
+            # Send request
+            await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
+
+            # Wait for response with timeout
+            try:
+                await asyncio.wait_for(pending_request.future, timeout=2.0)
+                self._circuit_breaker.record_success()
+                return self.buzzer_state
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "Timeout waiting for buzzer state response (seq=%02x)",
+                    seq_id
+                )
+                # Clean up pending request
+                self._pending_requests.pop(request_key, None)
+                self._used_seq_ids.discard(seq_id)
+                self._circuit_breaker.record_failure()
+                return None
+
+        except BleakError as err:
+            _LOGGER.error("Bleak error reading buzzer state: %s", err)
+            self._circuit_breaker.record_failure()
+            self._client = None
+            return None
+        except Exception as err:
+            _LOGGER.error("Error reading buzzer state: %s", err, exc_info=True)
+            self._circuit_breaker.record_failure()
+            self._client = None
+            return None
+
+    async def set_buzzer_state(self, turn_on: bool) -> bool:
+        """Set buzzer state.
+
+        Args:
+            turn_on: True to turn on buzzer, False to turn off
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Check circuit breaker
+        can_attempt, reason = self._circuit_breaker.can_attempt()
+        if not can_attempt:
+            _LOGGER.warning(
+                "[CIRCUIT] Blocked set_buzzer_state: %s",
+                reason
+            )
+            return False
+
+        # Clean up expired requests
+        self._cleanup_expired_requests()
+
+        try:
+            # Ensure connection
+            client = await self._ensure_connected()
+
+            # Prepare request with random sequence ID
+            # Set buzzer state: [seq_id][0x50][0x00][state]
+            seq_id = self._get_random_sequence_id()
+            state_byte = BUZZER_ON if turn_on else BUZZER_OFF
+            request = bytes([seq_id, CMD_BUZZER, 0x00, state_byte])
+
+            hex_parts = ' '.join([f'{b:02x}' for b in request])
+            _LOGGER.debug(
+                "[TX] (设置蜂鸣器状态)[0x %s] %s",
+                hex_parts,
+                "开启" if turn_on else "关闭"
+            )
+
+            # Create pending request and add to cache
+            pending_request = PendingRequest(
+                seq_id=seq_id,
+                sensor_id=0x00,  # Use 0x00 as placeholder for buzzer
+                future=asyncio.Future(),
+                timestamp=time.time()
+            )
+            request_key = (seq_id, 0x00)
+            self._pending_requests[request_key] = pending_request
+
+            # Send request
+            await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
+
+            # Wait for response with timeout
+            try:
+                await asyncio.wait_for(pending_request.future, timeout=2.0)
+
+                # Verify the state was set correctly
+                if self.buzzer_state == turn_on:
+                    _LOGGER.info(
+                        "[BUZZER] ✓ Successfully %s buzzer",
+                        "turned on" if turn_on else "turned off"
+                    )
+                    self._circuit_breaker.record_success()
+                    return True
+                else:
+                    _LOGGER.warning(
+                        "[BUZZER] ✗ State mismatch: expected %s, got %s",
+                        turn_on, self.buzzer_state
+                    )
+                    self._circuit_breaker.record_failure()
+                    return False
+
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "Timeout waiting for buzzer set response (seq=%02x)",
+                    seq_id
+                )
+                # Clean up pending request
+                self._pending_requests.pop(request_key, None)
+                self._used_seq_ids.discard(seq_id)
+                self._circuit_breaker.record_failure()
+                return False
+
+        except BleakError as err:
+            _LOGGER.error("Bleak error setting buzzer state: %s", err)
+            self._circuit_breaker.record_failure()
+            self._client = None
+            return False
+        except Exception as err:
+            _LOGGER.error("Error setting buzzer state: %s", err, exc_info=True)
+            self._circuit_breaker.record_failure()
+            self._client = None
+            return False
