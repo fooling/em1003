@@ -718,26 +718,40 @@ class EM1003Device:
 
                 # Apply sensor-specific scaling and offsets
                 formula_desc = ""
+                calculated_value = None
+
                 if sensor_id == 0x01:
                     # Temperature: (raw - 4000) / 100
-                    self.sensor_data[sensor_id] = (raw_value - 4000) / 100.0
+                    calculated_value = (raw_value - 4000) / 100.0
                     formula_desc = f"({raw_value} - 4000) / 100"
                 elif sensor_id == 0x06:
                     # Humidity: raw / 100
-                    self.sensor_data[sensor_id] = raw_value / 100.0
+                    calculated_value = raw_value / 100.0
                     formula_desc = f"{raw_value} / 100"
                 elif sensor_id == 0x0A:
                     # Formaldehyde: (raw - 16384) / 1000
-                    self.sensor_data[sensor_id] = (raw_value - 16384) / 1000.0
+                    calculated_value = (raw_value - 16384) / 1000.0
                     formula_desc = f"({raw_value} - 16384) / 1000"
                 elif sensor_id in [0x08, 0x09, 0x11, 0x12, 0x13]:
                     # Noise, PM2.5, PM10, TVOC, eCO2: raw value directly
-                    self.sensor_data[sensor_id] = raw_value
+                    calculated_value = raw_value
                     formula_desc = f"{raw_value} (direct)"
                 else:
                     # Other sensors use raw value directly (Noise, etc.)
-                    self.sensor_data[sensor_id] = raw_value
+                    calculated_value = raw_value
                     formula_desc = f"{raw_value} (direct)"
+
+                # Filter out negative values for specific sensors
+                # Skip data if negative for: Humidity, Noise, PM2.5, Formaldehyde, PM10, TVOC, eCO2
+                if sensor_id in [0x06, 0x08, 0x09, 0x0A, 0x11, 0x12, 0x13] and calculated_value < 0:
+                    _LOGGER.warning(
+                        "[FILTER] ✗ %s (0x%02x): Skipping negative value %s (formula: %s)",
+                        sensor_name, sensor_id, calculated_value, formula_desc
+                    )
+                    # Don't update sensor_data, effectively skipping this reading
+                else:
+                    # Only store valid (non-negative) values
+                    self.sensor_data[sensor_id] = calculated_value
 
                 unit = sensor_info.get("unit", "")
                 final_value = self.sensor_data.get(sensor_id)
