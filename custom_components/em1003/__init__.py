@@ -33,7 +33,7 @@ from .device import EM1003Device
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.SENSOR]
+PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.SWITCH]
 
 
 async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str | None:

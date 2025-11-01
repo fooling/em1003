@@ -37,6 +37,12 @@ Example: 33 00 → 0x33 + (0x00 × 256) = 51 decimal
 - `0x12` TVOC (mg/m³)
 - `0x13` eCO2 (ppm)
 
+**Buzzer Control** (CONFIRMED):
+- Command: `0x50`
+- Query state: `[seq_id][0x50][0x00]` → Response: `[seq_id][0x50][0x00][state]`
+- Turn on: `[seq_id][0x50][0x00][0x01]` → Response: `[seq_id][0x50][0x00][0x01]`
+- Turn off: `[seq_id][0x50][0x00][0x00]` → Response: `[seq_id][0x50][0x00][0x00]`
+
 ---
 
 ## Device Information
@@ -104,6 +110,54 @@ The device responds via the notify characteristic (`0xFFF4`) with a 5-byte messa
 - **Bytes 3-4 - Value** (`33 00`): Sensor reading as 16-bit Big Endian unsigned integer
   - High byte first, then low byte
   - Example: `33 00` = `0x3300` = 13056 in hex notation, but interpreted as Big Endian = `0x0033` = **51 decimal**
+
+### Buzzer Control Protocol
+
+The device supports buzzer control through command `0x50`.
+
+#### Query Buzzer State
+
+**Request Format** (3 bytes):
+```
+[Sequence ID] [0x50] [0x00]
+```
+
+**Response Format** (4 bytes):
+```
+[Sequence ID] [0x50] [0x00] [State]
+```
+
+- **State**: `0x01` = Buzzer ON, `0x00` = Buzzer OFF
+
+**Example**:
+```
+Request:  AC 50 00
+Response: AC 50 00 01    # Buzzer is ON
+```
+
+#### Set Buzzer State
+
+**Request Format** (4 bytes):
+```
+[Sequence ID] [0x50] [0x00] [State]
+```
+
+**Response Format** (4 bytes):
+```
+[Sequence ID] [0x50] [0x00] [State]
+```
+
+**Turn ON**:
+```
+Request:  AC 50 00 01
+Response: AC 50 00 01    # Successfully turned ON
+```
+
+**Turn OFF**:
+```
+Request:  AC 50 00 00
+Response: AC 50 00 00    # Successfully turned OFF
+```
 
 ### Sensor ID Mapping
 
@@ -278,9 +332,14 @@ Many embedded systems and IoT devices use Little Endian format because it allows
   - `0x11` = PM10 (µg/m³) - formula: `raw`
   - `0x12` = TVOC (mg/m³) - formula: `raw × 0.001`
   - `0x13` = eCO2 (ppm) - formula: `raw`
+- ✅ **Buzzer Control confirmed**:
+  - Command `0x50` for buzzer control
+  - Query state: 3-byte request → 4-byte response with state
+  - Set state: 4-byte request → 4-byte response confirming state
+  - State values: `0x00` = OFF, `0x01` = ON
 
 ### To Be Determined
-- ❓ Other command types besides `0x06`
+- ❓ Other command types besides `0x06` (sensor read) and `0x50` (buzzer control)
 - ❓ Error handling and timeout behavior
 - ❓ Battery level reading (if supported)
 
@@ -289,12 +348,30 @@ Many embedded systems and IoT devices use Little Endian format because it allows
 ```
 1. Connect to device via BLE
 2. Subscribe to notifications on 0xFFF4
+
+# Reading Sensor Data
 3. Write to 0xFFF1: [0xAC, 0x06, 0x08]
    └─> Request sensor 0x08 (Noise) with sequence ID 0xAC
 4. Receive from 0xFFF4: [0xAC, 0x06, 0x08, 0x31, 0x00]
    └─> Response: seq=0xAC, cmd=0x06, sensor=0x08, value_bytes=[0x31, 0x00]
 5. Parse Little Endian value: 0x31 + (0x00 × 256) = 49 dB
 6. Repeat for other sensor IDs (0x01, 0x06, 0x09, 0x0A, 0x11, 0x12, 0x13)
+
+# Buzzer Control
+7. Query buzzer state:
+   Write to 0xFFF1: [0xAD, 0x50, 0x00]
+   Receive from 0xFFF4: [0xAD, 0x50, 0x00, 0x00]
+   └─> Buzzer is OFF
+
+8. Turn on buzzer:
+   Write to 0xFFF1: [0xAE, 0x50, 0x00, 0x01]
+   Receive from 0xFFF4: [0xAE, 0x50, 0x00, 0x01]
+   └─> Buzzer turned ON successfully
+
+9. Turn off buzzer:
+   Write to 0xFFF1: [0xAF, 0x50, 0x00, 0x00]
+   Receive from 0xFFF4: [0xAF, 0x50, 0x00, 0x00]
+   └─> Buzzer turned OFF successfully
 ```
 
 ### Detailed Example with Multiple Sensors
