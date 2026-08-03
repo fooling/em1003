@@ -70,9 +70,7 @@ class EM1003BuzzerSwitch(SwitchEntity):
         self._attr_is_on = None
         self._attr_available = True
 
-        # Subscribe to coordinator updates if available
-        if self._coordinator:
-            self._coordinator_listener = None
+        self._coordinator_listener = None
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -95,7 +93,16 @@ class EM1003BuzzerSwitch(SwitchEntity):
                 self._handle_coordinator_update
             )
 
-        # Try to read initial buzzer state
+        # A BLE read takes tens of seconds when the device is asleep, so keep it off
+        # the setup path; the coordinator also refreshes this state on every cycle.
+        self._config_entry.async_create_background_task(
+            self.hass,
+            self._async_read_initial_state(),
+            f"em1003 initial buzzer state {self._mac_address}",
+        )
+
+    async def _async_read_initial_state(self) -> None:
+        """Read the buzzer state once, in the background."""
         try:
             _LOGGER.debug("Reading initial buzzer state for %s", self._mac_address)
             state = await self._em1003_device.read_buzzer_state()
@@ -106,14 +113,15 @@ class EM1003BuzzerSwitch(SwitchEntity):
                     self._mac_address,
                     "ON" if state else "OFF"
                 )
+                self.async_write_ha_state()
             else:
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "Could not read initial buzzer state for %s, will retry on first interaction",
                     self._mac_address
                 )
                 self._attr_is_on = None
         except Exception as err:
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "Error reading initial buzzer state for %s: %s",
                 self._mac_address,
                 err

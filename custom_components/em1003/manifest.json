@@ -3,7 +3,7 @@
   "name": "EM1003 BLE Sensor (720环境宝3)",
   "codeowners": [],
   "config_flow": true,
-  "dependencies": [],
+  "dependencies": ["bluetooth"],
   "documentation": "https://github.com/yourusername/em1003",
   "integration_type": "device",
   "iot_class": "local_polling",

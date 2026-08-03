@@ -129,5 +129,19 @@ DEFAULT_NAME = "EM1003"
 DEFAULT_SCAN_INTERVAL = 60  # Default polling interval in seconds
 DEVICE_TIMEOUT = 30.0
 
+# Stale connection recovery.
+# BlueZ runs on the host, so an unclean container/HA restart leaves the ACL link
+# open. The device then stops advertising and no scan can find it again.
+STALE_SETTLE_TIME = 3.0  # Seconds to wait after tearing the link down
+STALE_REDISCOVER_TIMEOUT = 12.0  # How long to wait for the device to advertise again
+STALE_REDISCOVER_INTERVAL = 0.5  # Poll interval while waiting for re-discovery
+
+# BlueZ answers "Operation already in progress" while it is still finishing a
+# previous connect or disconnect, which is common right after a restart. It rejects
+# the call without starting a connection, so no BLE slot is consumed and retrying is
+# safe.
+BLUEZ_BUSY_RETRY_DELAY = 5.0
+BLUEZ_BUSY_MAX_ATTEMPTS = 4
+
 # Version
 VERSION = "1.0.3"

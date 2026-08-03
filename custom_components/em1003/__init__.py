@@ -9,8 +9,8 @@ from bleak_retry_connector import establish_connection
 
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
+from homeassistant.core import Event, HomeAssistant, ServiceCall, callback
 from homeassistant.helpers import device_registry as dr
 import voluptuous as vol
 
@@ -34,6 +34,25 @@ from .device import EM1003Device
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.SWITCH]
+
+
+@callback
+def async_advertised_name(hass: HomeAssistant, mac_address: str) -> str | None:
+    """Return the name carried in the BLE advertisement, without connecting.
+
+    Opening a link here would race with the platform setups, and BlueZ then rejects
+    both connects with "Operation already in progress".
+    """
+    device = bluetooth.async_ble_device_from_address(hass, mac_address, connectable=True)
+
+    if device is None or not device.name:
+        return None
+
+    name = device.name.strip()
+    if not name or name == mac_address:
+        return None
+
+    return name
 
 
 async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str | None:
@@ -65,6 +84,14 @@ async def async_read_device_name(hass: HomeAssistant, mac_address: str) -> str |
         try:
             _LOGGER.debug("Connected to device %s to read name", mac_address)
 
+            # Not every device exposes Generic Access, which is not an error.
+            if client.services.get_characteristic(DEVICE_NAME_UUID) is None:
+                _LOGGER.debug(
+                    "Device %s does not expose the Device Name characteristic",
+                    mac_address,
+                )
+                return None
+
             # Read the Device Name characteristic (0x2A00)
             value = await client.read_gatt_char(DEVICE_NAME_UUID)
             device_name = value.decode('utf-8').strip()
@@ -91,17 +118,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     _LOGGER.info("Setting up EM1003 device with MAC: %s", mac_address)
 
-    # Try to read device name from BLE device
-    device_name = await async_read_device_name(hass, mac_address)
+    # Create the device first so a link left open by a previous run can be released
+    # before anything tries to connect. BlueZ lives outside the container, so an
+    # unclean restart leaves the device connected and therefore not advertising.
+    em1003_device = EM1003Device(hass, mac_address)
+    await em1003_device.async_release_stale_connection()
+
+    device_name = async_advertised_name(hass, mac_address)
 
     if device_name:
-        _LOGGER.info("Successfully read device name: %s", device_name)
+        _LOGGER.info("Using advertised device name: %s", device_name)
     else:
-        _LOGGER.warning("Could not read device name, using default: %s", entry.title)
+        _LOGGER.debug("No advertised name for %s, using %s", mac_address, entry.title)
         device_name = entry.title
 
-    # Create EM1003 device instance with device name
-    em1003_device = EM1003Device(hass, mac_address, device_name)
+    em1003_device.device_name = device_name
+
+    async def _async_release_link_on_stop(_event: Event) -> None:
+        """Drop the BLE link so the device advertises again after a restart."""
+        await em1003_device.async_shutdown()
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_release_link_on_stop)
+    )
 
     # Register device in device registry before creating entities
     device_registry = dr.async_get(hass)
@@ -135,7 +174,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id)
+        data = hass.data[DOMAIN].pop(entry.entry_id)
+        # Release the link, otherwise the device stays silent for the next setup.
+        await data["device"].async_shutdown()
 
     return unload_ok
 
