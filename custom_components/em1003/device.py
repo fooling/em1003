@@ -9,7 +9,12 @@ from dataclasses import dataclass
 
 from bleak import BleakClient
 from bleak.exc import BleakError
-from bleak_retry_connector import establish_connection
+from bleak_retry_connector import (
+    IS_LINUX,
+    close_stale_connections_by_address,
+    establish_connection,
+)
+from bleak_retry_connector import get_device as get_bluez_device
 
 from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant
@@ -23,6 +28,11 @@ from .const import (
     EM1003_NOTIFY_CHAR_UUID,
     EM1003_WRITE_CHAR_UUID,
     SENSOR_TYPES,
+    BLUEZ_BUSY_MAX_ATTEMPTS,
+    BLUEZ_BUSY_RETRY_DELAY,
+    STALE_REDISCOVER_INTERVAL,
+    STALE_REDISCOVER_TIMEOUT,
+    STALE_SETTLE_TIME,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -159,6 +169,9 @@ class EM1003Device:
         self.mac_address = mac_address
         self.device_name = device_name or mac_address  # Use MAC as fallback
         self._client: BleakClient | None = None
+        # BlueZ rejects a second connect while one is still in flight, so only one
+        # caller may establish the link; the rest reuse the client it produced.
+        self._connect_lock = asyncio.Lock()
         self.sensor_data: dict[int, float | None] = {}
         self.buzzer_state: bool | None = None  # Buzzer state (True=on, False=off, None=unknown)
         self._last_disconnect_time: float | None = None
@@ -287,6 +300,121 @@ class EM1003Device:
             _LOGGER.info("Waiting %.1fs before retry (connection abort backoff)", abort_backoff)
             await asyncio.sleep(abort_backoff)
 
+    async def _async_bluez_device(self):
+        """Query BlueZ directly for the device object.
+
+        Unlike Home Assistant's advertisement cache, BlueZ keeps the device object
+        around even while the device is connected and therefore not advertising.
+        """
+        if not IS_LINUX:
+            return None
+        try:
+            return await get_bluez_device(self.mac_address)
+        except Exception as err:
+            _LOGGER.debug("[STALE] Could not query BlueZ for %s: %s", self.mac_address, err)
+            return None
+
+    async def async_release_stale_connection(self) -> bool:
+        """Tear down a connection left open in the host Bluetooth stack.
+
+        BlueZ runs on the host, so an unclean container or Home Assistant restart
+        leaves the ACL link established. A connected BLE peripheral stops
+        advertising, which makes it undiscoverable until that link is dropped -
+        previously this could only be resolved by power cycling the device.
+
+        Returns:
+            True if a stale connection was found and released.
+        """
+        device = await self._async_bluez_device()
+        if device is None:
+            return False
+
+        props = (device.details or {}).get("props") or {}
+        if not props.get("Connected"):
+            return False
+
+        _LOGGER.warning(
+            "[STALE] %s is still connected in the host Bluetooth stack but is not "
+            "advertising. Releasing the stale link to make it discoverable again",
+            self._device_id(),
+        )
+        try:
+            await close_stale_connections_by_address(
+                self.mac_address, only_other_adapters=False
+            )
+        except Exception as err:
+            _LOGGER.error("[STALE] ✗ Failed to release stale connection: %s", err)
+            return False
+
+        self._client = None
+        self._last_disconnect_time = time.time()
+
+        # Give BlueZ time to finish the teardown, otherwise the next connect gets
+        # rejected with "Operation already in progress".
+        await asyncio.sleep(STALE_SETTLE_TIME)
+
+        _LOGGER.info("[STALE] ✓ Released stale connection to %s", self.mac_address)
+        return True
+
+    async def _async_rediscover(self):
+        """Wait for the device to advertise again after its link was torn down."""
+        deadline = time.time() + STALE_REDISCOVER_TIMEOUT
+        while time.time() < deadline:
+            device = bluetooth.async_ble_device_from_address(
+                self.hass, self.mac_address, connectable=True
+            )
+            if device:
+                _LOGGER.info("[STALE] ✓ %s is advertising again", self.mac_address)
+                return device
+            await asyncio.sleep(STALE_REDISCOVER_INTERVAL)
+
+        # Advertising can take longer than we are willing to wait here, but BlueZ
+        # still knows the device and bleak can connect using that object directly.
+        device = await self._async_bluez_device()
+        if device:
+            _LOGGER.info(
+                "[STALE] %s is not advertising yet, connecting via the BlueZ device object",
+                self.mac_address,
+            )
+        return device
+
+    async def _connect_retrying_while_busy(self, device) -> BleakClient:
+        """Connect, retrying once while the Bluetooth stack is still busy.
+
+        Right after a restart BlueZ is often still finishing a disconnect and rejects
+        the next connect with "Operation already in progress". It does so without
+        starting a connection, so no BLE slot is consumed and waiting it out is safe.
+
+        establish_connection keeps max_attempts=1 on purpose: a genuinely failed
+        attempt can hold a connection slot that is not released immediately, so
+        retrying inside bleak-retry-connector can exhaust every slot.
+        """
+        for attempt in range(1, BLUEZ_BUSY_MAX_ATTEMPTS + 1):
+            try:
+                return await establish_connection(
+                    BleakClient,
+                    device,
+                    self.mac_address,
+                    disconnected_callback=lambda _: None,
+                    max_attempts=1,
+                    timeout=30.0,
+                )
+            except Exception as err:
+                is_busy = "already in progress" in str(err).lower()
+                if not is_busy or attempt == BLUEZ_BUSY_MAX_ATTEMPTS:
+                    raise
+                _LOGGER.info(
+                    "[CONN] Bluetooth stack still busy for %s (attempt %d/%d), "
+                    "retrying in %.1fs",
+                    self.mac_address,
+                    attempt,
+                    BLUEZ_BUSY_MAX_ATTEMPTS,
+                    BLUEZ_BUSY_RETRY_DELAY,
+                )
+                await asyncio.sleep(BLUEZ_BUSY_RETRY_DELAY)
+
+        raise BleakError(f"Could not connect to {self.mac_address}")
+
     async def _establish_connection(self) -> BleakClient:
         """Establish a connection to the device with proper error handling.
 
@@ -315,6 +443,12 @@ class EM1003Device:
             self.mac_address,
             connectable=True
         )
+
+        if not device:
+            # A link left open by a previous run stops the device from advertising,
+            # so release it and look again instead of failing outright.
+            if await self.async_release_stale_connection():
+                device = await self._async_rediscover()
 
         if not device:
             _LOGGER.error(
@@ -351,14 +485,7 @@ class EM1003Device:
                 self.mac_address, getattr(device, 'rssi', 'N/A')
             )
 
-            client = await establish_connection(
-                BleakClient,
-                device,
-                self.mac_address,
-                disconnected_callback=lambda _: None,
-                max_attempts=1,  # CRITICAL: Reduced to 1 to prevent slot exhaustion
-                timeout=30.0,  # 30 second timeout per attempt
-            )
+            client = await self._connect_retrying_while_busy(device)
 
             connection_duration = time.time() - connection_start_time
             _LOGGER.info(
@@ -538,74 +665,83 @@ class EM1003Device:
             )
             return self._client
 
-        _LOGGER.debug(
-            "[CONN] No active connection to %s, need to establish new connection",
-            self.mac_address
-        )
-
-        # Fast-fail if we recently failed to connect (unless circuit breaker is testing)
-        if self._last_connection_failure_time is not None:
-            time_since_failure = time.time() - self._last_connection_failure_time
-
-            # Only fast-fail if we're not in HALF_OPEN state (testing phase)
-            if time_since_failure < self._fast_fail_window and self._circuit_breaker.state != "HALF_OPEN":
-                remaining = self._fast_fail_window - time_since_failure
+        async with self._connect_lock:
+            # Another caller may have finished connecting while we waited.
+            if self._client and self._client.is_connected:
                 _LOGGER.debug(
-                    "[CONN] Fast-fail: Recent connection failure (%.0fs ago), "
-                    "skipping connection attempt for %.0fs more",
-                    time_since_failure, remaining
+                    "[CONN] ✓ Reusing connection to %s opened by a concurrent caller",
+                    self.mac_address
                 )
-                raise BleakError(
-                    f"Fast-fail: Connection failed {time_since_failure:.0f}s ago, "
-                    f"will retry after {remaining:.0f}s"
-                )
+                return self._client
 
-        # PRIORITY 2: Need to establish a new connection via active BLE scanning
-        _LOGGER.info(
-            "[CONN] Establishing new connection to %s via active BLE scan",
-            self.mac_address
-        )
+            _LOGGER.debug(
+                "[CONN] No active connection to %s, need to establish new connection",
+                self.mac_address
+            )
 
-        try:
-            self._client = await self._establish_connection()
+            # Fast-fail if we recently failed to connect (unless circuit breaker is testing)
+            if self._last_connection_failure_time is not None:
+                time_since_failure = time.time() - self._last_connection_failure_time
 
-            # Subscribe to notifications (only need to do this once per connection)
+                # Only fast-fail if we're not in HALF_OPEN state (testing phase)
+                if time_since_failure < self._fast_fail_window and self._circuit_breaker.state != "HALF_OPEN":
+                    remaining = self._fast_fail_window - time_since_failure
+                    _LOGGER.debug(
+                        "[CONN] Fast-fail: Recent connection failure (%.0fs ago), "
+                        "skipping connection attempt for %.0fs more",
+                        time_since_failure, remaining
+                    )
+                    raise BleakError(
+                        f"Fast-fail: Connection failed {time_since_failure:.0f}s ago, "
+                        f"will retry after {remaining:.0f}s"
+                    )
+
+            # PRIORITY 2: Need to establish a new connection via active BLE scanning
+            _LOGGER.info(
+                "[CONN] Establishing new connection to %s via active BLE scan",
+                self.mac_address
+            )
+
             try:
-                await self._client.start_notify(EM1003_NOTIFY_CHAR_UUID, self._notification_handler)
-                _LOGGER.debug("[CONN] ✓ Connected and subscribed to %s", self.mac_address)
+                self._client = await self._establish_connection()
 
-                # Connection successful - clear failure timestamp
-                self._last_connection_failure_time = None
+                # Subscribe to notifications (only need to do this once per connection)
+                try:
+                    await self._client.start_notify(EM1003_NOTIFY_CHAR_UUID, self._notification_handler)
+                    _LOGGER.debug("[CONN] ✓ Connected and subscribed to %s", self.mac_address)
+
+                    # Connection successful - clear failure timestamp
+                    self._last_connection_failure_time = None
+
+                except Exception as err:
+                    # Failed to subscribe, disconnect and re-raise
+                    _LOGGER.error("[CONN] Failed to subscribe to notifications: %s", err)
+                    # CRITICAL: Ensure connection is properly cleaned up to free slot
+                    if self._client is not None:
+                        try:
+                            await self._client.disconnect()
+                            _LOGGER.debug("[CONN] Disconnected after subscription failure to free slot")
+                        except Exception as disconnect_err:
+                            _LOGGER.debug("[CONN] Error during cleanup disconnect: %s", disconnect_err)
+                    self._client = None
+                    # Record failure timestamp
+                    self._last_connection_failure_time = time.time()
+                    raise
+
+                return self._client
 
             except Exception as err:
-                # Failed to subscribe, disconnect and re-raise
-                _LOGGER.error("[CONN] Failed to subscribe to notifications: %s", err)
-                # CRITICAL: Ensure connection is properly cleaned up to free slot
+                # Record failure timestamp for fast-fail
+                self._last_connection_failure_time = time.time()
+                # CRITICAL: Ensure client is cleared so it doesn't hold a stale connection
                 if self._client is not None:
                     try:
                         await self._client.disconnect()
-                        _LOGGER.debug("[CONN] Disconnected after subscription failure to free slot")
-                    except Exception as disconnect_err:
-                        _LOGGER.debug("[CONN] Error during cleanup disconnect: %s", disconnect_err)
-                self._client = None
-                # Record failure timestamp
-                self._last_connection_failure_time = time.time()
+                        _LOGGER.debug("[CONN] Disconnected after connection error to free slot")
+                    except Exception:
+                        pass
+                    self._client = None
                 raise
-
-            return self._client
-
-        except Exception as err:
-            # Record failure timestamp for fast-fail
-            self._last_connection_failure_time = time.time()
-            # CRITICAL: Ensure client is cleared so it doesn't hold a stale connection
-            if self._client is not None:
-                try:
-                    await self._client.disconnect()
-                    _LOGGER.debug("[CONN] Disconnected after connection error to free slot")
-                except Exception:
-                    pass
-                self._client = None
-            raise
 
     async def disconnect(self) -> None:
         """Explicitly disconnect from the device."""
@@ -629,6 +765,28 @@ class EM1003Device:
         else:
             _LOGGER.debug("[CONN] Already disconnected from %s", self.mac_address)
             self._client = None
+
+    async def async_shutdown(self) -> None:
+        """Disconnect and make sure the host Bluetooth stack drops the link.
+
+        bleak's disconnect does not reliably tear down the ACL link in BlueZ, and a
+        link left open keeps the device from advertising on the next start, so force
+        the teardown here.
+        """
+        await self.disconnect()
+
+        if not IS_LINUX:
+            return
+
+        try:
+            await close_stale_connections_by_address(
+                self.mac_address, only_other_adapters=False
+            )
+            _LOGGER.debug(
+                "[STALE] Forced link teardown for %s during shutdown", self.mac_address
+            )
+        except Exception as err:
+            _LOGGER.debug("[STALE] Could not force link teardown: %s", err)
 
     def _notification_handler(self, sender, data: bytearray) -> None:
         """Handle notification from device.
