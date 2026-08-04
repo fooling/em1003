@@ -1218,13 +1218,16 @@ class EM1003Device:
         except BleakError as err:
             _LOGGER.error("Bleak error reading buzzer state: %s", err)
             self._circuit_breaker.record_failure()
-            self._client = None
             return None
         except Exception as err:
             _LOGGER.error("Error reading buzzer state: %s", err, exc_info=True)
             self._circuit_breaker.record_failure()
-            self._client = None
             return None
+        finally:
+            # CRITICAL: Disconnect after the query, same as read_all_sensors does.
+            # A link left open holds a connection slot, and a connected BLE
+            # peripheral stops advertising, so the device cannot be found again.
+            await self.disconnect()
 
     async def set_buzzer_state(self, turn_on: bool) -> bool:
         """Set buzzer state.
@@ -1345,10 +1348,13 @@ class EM1003Device:
         except BleakError as err:
             _LOGGER.error("Bleak error setting buzzer state: %s", err)
             self._circuit_breaker.record_failure()
-            self._client = None
             return False
         except Exception as err:
             _LOGGER.error("Error setting buzzer state: %s", err, exc_info=True)
             self._circuit_breaker.record_failure()
-            self._client = None
             return False
+        finally:
+            # CRITICAL: Disconnect after the command, same as read_all_sensors does.
+            # A link left open holds a connection slot, and a connected BLE
+            # peripheral stops advertising, so the device cannot be found again.
+            await self.disconnect()
