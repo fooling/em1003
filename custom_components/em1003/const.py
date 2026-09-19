@@ -124,10 +124,59 @@ SENSOR_TYPES = {
 # Configuration keys
 CONF_SCAN_INTERVAL = "scan_interval"
 
+# Additive config-entry data key. Never required: entries created before
+# version 1.1.0 simply do not have it and must keep working.
+CONF_DEVICE_NAME = "device_name"
+
 # Default values
 DEFAULT_NAME = "EM1003"
 DEFAULT_SCAN_INTERVAL = 60  # Default polling interval in seconds
-DEVICE_TIMEOUT = 30.0
+DEVICE_TIMEOUT = 30.0  # Deprecated/unused, kept so old imports keep working
 
-# Version
-VERSION = "1.0.3"
+# ---------------------------------------------------------------------------
+# BLE timing budget, in seconds.
+#
+# Every one of these is looked up at call time as ``const.<NAME>`` so that
+# tests can shrink the whole budget with ``monkeypatch.setattr`` on this
+# module. Never capture them in a default argument or an instance attribute.
+# ---------------------------------------------------------------------------
+BLE_CONNECT_TIMEOUT = 20.0  # bound on establish_connection()
+BLE_START_NOTIFY_TIMEOUT = 10.0  # bound on client.start_notify()
+BLE_WRITE_TIMEOUT = 5.0  # bound on client.write_gatt_char()
+BLE_RESPONSE_TIMEOUT = 2.0  # bound on waiting for one notification
+BLE_READ_CHAR_TIMEOUT = 10.0  # bound on client.read_gatt_char()
+BLE_STOP_NOTIFY_TIMEOUT = 5.0  # bound on client.stop_notify()
+BLE_DISCONNECT_TIMEOUT = 10.0  # bound on client.disconnect()
+# Overall deadline for ONE session (connect + body). Arithmetic for the worst
+# *legitimate* poll: connect 20s + 9 requests (8 sensors + the buzzer query)
+# x (write + response ~2s + 0.3s pacing) ~= 20 + 21 = 41s, plus start_notify
+# and teardown. 60s leaves room for that while still cutting off a wedged
+# session in a minute instead of two - the deadline exists to stop a stuck
+# link, not to let every per-step timeout expire back to back.
+BLE_SESSION_TIMEOUT = 60.0
+# Bound on the unload-time `device.disconnect()`, which waits on the device
+# lock. The in-flight session that holds it always closes its own link, so
+# giving up here only stops a reload from stalling for a whole session budget.
+BLE_UNLOAD_DISCONNECT_TIMEOUT = 10.0
+BLE_RECONNECT_GUARD = 2.0  # min seconds between our disconnect and our next connect
+BLE_INTER_REQUEST_DELAY = 0.3  # pause between consecutive sensor requests
+BLE_BUZZER_SETTLE_DELAY = 0.1  # pause between buzzer SET and the verify QUERY
+
+# ---------------------------------------------------------------------------
+# Circuit breaker tuning
+# ---------------------------------------------------------------------------
+CIRCUIT_FAILURE_THRESHOLD = 3
+CIRCUIT_OPEN_DURATION = 60.0
+CIRCUIT_MAX_OPEN_DURATION = 3600.0
+
+# ---------------------------------------------------------------------------
+# Protocol / bookkeeping
+# ---------------------------------------------------------------------------
+# Sensors whose negative readings are bogus and must be dropped.
+NEGATIVE_FILTER_SENSOR_IDS = (0x06, 0x08, 0x09, 0x0A, 0x11, 0x12, 0x13)
+
+# How many recently-completed sequence ids the allocator avoids reusing.
+SEQ_ID_QUARANTINE = 16
+
+# Version (must equal manifest.json "version")
+VERSION = "1.1.0"

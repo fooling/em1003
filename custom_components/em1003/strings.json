@@ -20,5 +20,19 @@
     "abort": {
       "already_configured": "Device is already configured"
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "EM1003 Options",
+        "description": "Configure EM1003 sensor parameters",
+        "data": {
+          "scan_interval": "Scan Interval (seconds)"
+        },
+        "data_description": {
+          "scan_interval": "Time interval between sensor data collection, range 10-600 seconds, default 60 seconds. Longer intervals can improve stability and save device battery."
+        }
+      }
+    }
   }
 }

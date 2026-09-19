@@ -1,1360 +1,925 @@
-"""BLE device client for EM1003 air quality sensor."""
+"""BLE device client for the EM1003 air quality sensor.
+
+Everything that talks to the BLE stack lives here, behind a single
+``asyncio.Lock``: one link at a time per device, always torn down, and every
+``await`` on the BLE path bounded by a timeout from :mod:`.const`.
+
+See ``docs/ble_session_refactor.md`` section 4 for the authoritative contract.
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
 import random
 import time
+from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
 from bleak import BleakClient
 from bleak.exc import BleakError
-from bleak_retry_connector import establish_connection
+from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 
 from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant
 
+from . import const
 from .const import (
-    CMD_READ_SENSOR,
+    BUZZER_OFF,
+    BUZZER_ON,
     CMD_BUZZER,
     CMD_BUZZER_SET_RESPONSE,
-    BUZZER_ON,
-    BUZZER_OFF,
+    CMD_READ_SENSOR,
+    DEVICE_NAME_UUID,
     EM1003_NOTIFY_CHAR_UUID,
     EM1003_WRITE_CHAR_UUID,
+    NEGATIVE_FILTER_SENSOR_IDS,
     SENSOR_TYPES,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
+#: Match key used for the buzzer state query response (``[seq, 0x50, 0x00, x]``).
+BUZZER_QUERY_KEY = 0x00
+#: Match key used for the buzzer set acknowledgement (``[seq, 0x05, state]``).
+BUZZER_SET_KEY = 0x01
+
+# Breaker gate modes for :meth:`EM1003Device._async_session`.
+_GATE_NONE = "none"  # breaker neither consulted nor updated
+_GATE_CHECK = "check"  # normal: rejected calls do not run at all
+_GATE_BYPASS = "bypass"  # user action: runs anyway, can only help the breaker
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers (no I/O, no state)
+# ---------------------------------------------------------------------------
+
+
+def parse_sensor_value(sensor_id: int, value_bytes: bytes | bytearray) -> float | int | None:
+    """Decode the 2-byte little-endian payload of one sensor response.
+
+    Returns ``None`` for a payload that is too short. Never raises.
+    """
+    if value_bytes is None or len(value_bytes) < 2:
+        return None
+
+    raw = int.from_bytes(bytes(value_bytes[:2]), byteorder="little")
+
+    if sensor_id == 0x01:
+        # Temperature: (raw - 4000) / 100
+        return (raw - 4000) / 100.0
+    if sensor_id == 0x06:
+        # Humidity: raw / 100
+        return raw / 100.0
+    if sensor_id == 0x0A:
+        # Formaldehyde: (raw - 16384) / 1000
+        return (raw - 16384) / 1000.0
+    # Everything else is the raw value, kept as an int.
+    return raw
+
+
+def apply_negative_filter(sensor_id: int, value: float | int | None) -> float | int | None:
+    """Drop bogus negative readings for the sensors that cannot go below zero."""
+    if value is None:
+        return None
+    if sensor_id in NEGATIVE_FILTER_SENSOR_IDS and value < 0:
+        return None
+    return value
+
+
+def build_sensor_request(seq_id: int, sensor_id: int) -> bytes:
+    """Build a sensor read request frame."""
+    return bytes([seq_id, CMD_READ_SENSOR, sensor_id])
+
+
+def build_buzzer_query(seq_id: int) -> bytes:
+    """Build a buzzer state query frame."""
+    return bytes([seq_id, CMD_BUZZER, 0x00])
+
+
+def build_buzzer_set(seq_id: int, turn_on: bool) -> bytes:
+    """Build a buzzer set frame."""
+    return bytes([seq_id, CMD_BUZZER, 0x01, BUZZER_ON if turn_on else BUZZER_OFF])
+
+
+def _describe_error(err: BaseException) -> str:
+    """One short, always-non-empty description of a failure."""
+    if isinstance(err, TimeoutError):
+        return str(err) or "operation timed out"
+    return str(err) or type(err).__name__
+
+
+def match_key(data: bytes | bytearray) -> tuple[int, int] | None:
+    """Return the ``(seq_id, key)`` a notification answers, or ``None``.
+
+    ``None`` means "not a response we understand" — the frame is ignored and
+    must never complete an unrelated pending request.
+    """
+    if data is None or len(data) < 3:
+        return None
+    seq_id = data[0]
+    cmd = data[1]
+    if cmd == CMD_BUZZER_SET_RESPONSE:
+        return (seq_id, BUZZER_SET_KEY)
+    if cmd in (CMD_BUZZER, CMD_READ_SENSOR):
+        return (seq_id, data[2])
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Small data carriers
+# ---------------------------------------------------------------------------
+
 
 @dataclass
 class PendingRequest:
-    """Represents a pending sensor read request."""
+    """One request waiting for its notification."""
 
     seq_id: int
-    sensor_id: int
+    sensor_id: int  # match key: sensor id, 0x00 (buzzer query) or 0x01 (buzzer set)
     future: asyncio.Future
-    timestamp: float
+    timestamp: float  # monotonic, from the owning device's clock
+
+
+@dataclass(frozen=True)
+class EM1003PollResult:
+    """Result of one full poll (all sensors plus the buzzer state)."""
+
+    sensors: dict[int, float | int | None]
+    buzzer: bool | None
+    ok: bool
+    error: str | None = None
+
+    @classmethod
+    def failed(cls, error: str) -> "EM1003PollResult":
+        """Build an all-``None`` failure result carrying every sensor key."""
+        return cls(
+            sensors={sensor_id: None for sensor_id in SENSOR_TYPES},
+            buzzer=None,
+            ok=False,
+            error=error,
+        )
+
+
+@dataclass
+class _SessionResult:
+    """Internal outcome of one :meth:`EM1003Device._async_session` call."""
+
+    value: Any = None
+    admitted: bool = True
+    rejected_reason: str | None = None
+    error: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker
+# ---------------------------------------------------------------------------
 
 
 class CircuitBreaker:
-    """Circuit breaker pattern to prevent request pile-up during connection failures.
+    """Keeps a dead device from being hammered once it stops answering.
 
-    States:
-    - CLOSED: Normal operation, requests allowed
-    - OPEN: Too many failures, requests blocked for 60 seconds
-    - HALF_OPEN: After timeout, allow one test request
+    CLOSED   - normal operation.
+    OPEN     - blocked until ``current_open_duration`` has elapsed.
+    HALF_OPEN- exactly one probe is admitted; its outcome closes or re-opens.
+
+    Callers must report exactly one outcome per admitted call (either
+    :meth:`record_success` or :meth:`record_failure`). Rejected calls report
+    nothing, so they can never extend an outage.
     """
 
-    def __init__(self, failure_threshold: int = 3, open_duration: float = 60.0, max_backoff: float = 3600.0):
-        """Initialize circuit breaker.
+    STATE_CLOSED = "CLOSED"
+    STATE_OPEN = "OPEN"
+    STATE_HALF_OPEN = "HALF_OPEN"
 
-        Args:
-            failure_threshold: Number of failures before opening circuit
-            open_duration: Base seconds to wait before entering half-open state
-            max_backoff: Maximum backoff duration in seconds (default: 1 hour)
-        """
-        self.state = "CLOSED"
-        self.failure_count = 0
-        self.failure_threshold = failure_threshold
-        self.open_time: float | None = None
-        self.base_open_duration = open_duration
-        self.max_backoff = max_backoff
-
-    def record_success(self) -> None:
-        """Record successful operation - reset to CLOSED state."""
-        self.failure_count = 0
-        self.state = "CLOSED"
-        self.open_time = None
-        _LOGGER.debug("[CIRCUIT] ✓ Success recorded, circuit CLOSED")
-
-    def record_failure(self) -> None:
-        """Record failed operation - may open circuit."""
-        self.failure_count += 1
-        _LOGGER.debug(
-            "[CIRCUIT] ✗ Failure recorded (%d/%d)",
-            self.failure_count,
-            self.failure_threshold
+    def __init__(
+        self,
+        failure_threshold: int | None = None,
+        open_duration: float | None = None,
+        max_backoff: float | None = None,
+        *,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        """Initialise the breaker; ``clock`` defaults to ``time.monotonic``."""
+        self.failure_threshold = (
+            const.CIRCUIT_FAILURE_THRESHOLD if failure_threshold is None else failure_threshold
         )
+        self.base_open_duration = (
+            const.CIRCUIT_OPEN_DURATION if open_duration is None else open_duration
+        )
+        self.max_backoff = (
+            const.CIRCUIT_MAX_OPEN_DURATION if max_backoff is None else max_backoff
+        )
+        self._clock = clock
 
-        if self.failure_count >= self.failure_threshold:
-            self.state = "OPEN"
-            self.open_time = time.time()
+        self.state = self.STATE_CLOSED
+        self.failure_count = 0
+        self.open_time: float | None = None
+        self.current_open_duration = self.base_open_duration
+        self.probe_in_flight = False
 
-            # Calculate exponential backoff: base_duration * 2^(failures - threshold)
-            # Example: 3 failures → 60s, 4 → 120s, 5 → 240s, 6 → 480s, etc.
-            backoff_multiplier = 2 ** (self.failure_count - self.failure_threshold)
-            open_duration = min(self.base_open_duration * backoff_multiplier, self.max_backoff)
+    # -- clock ----------------------------------------------------------
 
-            _LOGGER.warning(
-                "[CIRCUIT] Circuit OPEN due to %d consecutive failures. "
-                "Blocking requests for %.0f seconds (exponential backoff)",
-                self.failure_count,
-                open_duration
-            )
+    def _now(self) -> float:
+        """Read the (late-bound) clock, monotonic by default."""
+        if self._clock is not None:
+            return self._clock()
+        return time.monotonic()
+
+    # -- admission ------------------------------------------------------
 
     def can_attempt(self) -> tuple[bool, str]:
-        """Check if request can proceed.
+        """Decide whether a call may run. Has side effects on state."""
+        if self.state == self.STATE_CLOSED:
+            return True, "closed"
 
-        Returns:
-            Tuple of (can_proceed, reason)
-        """
-        if self.state == "CLOSED":
-            return True, "Circuit closed"
-
-        elif self.state == "OPEN":
+        if self.state == self.STATE_OPEN:
             if self.open_time is None:
-                # Shouldn't happen, but handle gracefully
-                self.state = "CLOSED"
-                return True, "Circuit reset"
-
-            # Calculate current open duration with exponential backoff
-            backoff_multiplier = 2 ** (self.failure_count - self.failure_threshold)
-            open_duration = min(self.base_open_duration * backoff_multiplier, self.max_backoff)
-
-            elapsed = time.time() - self.open_time
-            if elapsed >= open_duration:
-                # CRITICAL FIX: Reset failure_count when entering HALF_OPEN
-                # This prevents infinite accumulation of failures
-                previous_failures = self.failure_count
+                # Defensive: OPEN without a timestamp cannot expire, so reset.
+                self.state = self.STATE_CLOSED
                 self.failure_count = 0
-                self.state = "HALF_OPEN"
-                _LOGGER.info(
-                    "[CIRCUIT] Circuit entering HALF_OPEN state after %.0f seconds "
-                    "(was %d failures, now testing recovery)",
-                    elapsed,
-                    previous_failures
-                )
-                return True, "Circuit half-open (testing)"
+                self.probe_in_flight = False
+                return True, "circuit reset"
 
-            remaining = open_duration - elapsed
-            return False, f"Circuit open ({remaining:.0f}s remaining, {self.failure_count} failures)"
+            elapsed = self._now() - self.open_time
+            if elapsed < self.current_open_duration:
+                remaining = self.current_open_duration - elapsed
+                return False, f"circuit open ({remaining:.0f}s remaining)"
 
-        else:  # HALF_OPEN
-            return True, "Circuit half-open (testing)"
+            self.state = self.STATE_HALF_OPEN
+            self.probe_in_flight = True
+            _LOGGER.info(
+                "[CIRCUIT] Half-open after %.0fs, admitting one probe", elapsed
+            )
+            return True, "half-open probe"
+
+        # HALF_OPEN
+        if self.probe_in_flight:
+            return False, "half-open probe in flight"
+        self.probe_in_flight = True
+        return True, "half-open probe"
+
+    # -- outcomes -------------------------------------------------------
+
+    def record_success(self) -> None:
+        """An admitted call succeeded: close the circuit and reset the backoff."""
+        was_closed = self.state == self.STATE_CLOSED and self.failure_count == 0
+        self.state = self.STATE_CLOSED
+        self.failure_count = 0
+        self.open_time = None
+        self.current_open_duration = self.base_open_duration
+        self.probe_in_flight = False
+        if not was_closed:
+            _LOGGER.info("[CIRCUIT] Recovered, circuit CLOSED")
+
+    def record_failure(self) -> None:
+        """An admitted call failed."""
+        self.failure_count += 1
+
+        if self.state == self.STATE_HALF_OPEN:
+            self.state = self.STATE_OPEN
+            self.open_time = self._now()
+            self.current_open_duration = min(
+                self.current_open_duration * 2, self.max_backoff
+            )
+            self.probe_in_flight = False
+            _LOGGER.warning(
+                "[CIRCUIT] Probe failed, circuit OPEN for %.0fs",
+                self.current_open_duration,
+            )
+            return
+
+        if self.state == self.STATE_OPEN:
+            # Defensive: only reachable if a caller bypassed the gate.
+            return
+
+        if self.failure_count >= self.failure_threshold:
+            self.state = self.STATE_OPEN
+            self.open_time = self._now()
+            self.current_open_duration = self.base_open_duration
+            _LOGGER.warning(
+                "[CIRCUIT] %d consecutive failures, circuit OPEN for %.0fs",
+                self.failure_count,
+                self.current_open_duration,
+            )
+
+    def reset(self) -> None:
+        """Force the breaker back to its pristine CLOSED state."""
+        self.state = self.STATE_CLOSED
+        self.failure_count = 0
+        self.open_time = None
+        self.current_open_duration = self.base_open_duration
+        self.probe_in_flight = False
 
     def get_state_info(self) -> str:
-        """Get human-readable state information."""
-        if self.state == "CLOSED":
+        """Human-readable state. Never raises, in any state."""
+        if self.state == self.STATE_CLOSED:
             return f"CLOSED (failures: {self.failure_count})"
-        elif self.state == "OPEN" and self.open_time:
-            # Calculate current open duration with exponential backoff
-            backoff_multiplier = 2 ** (self.failure_count - self.failure_threshold)
-            open_duration = min(self.base_open_duration * backoff_multiplier, self.max_backoff)
+        if self.state == self.STATE_HALF_OPEN:
+            return f"HALF_OPEN (probing, failures: {self.failure_count})"
+        if self.open_time is None:
+            return f"OPEN (no timestamp, failures: {self.failure_count})"
+        remaining = max(0.0, self.current_open_duration - (self._now() - self.open_time))
+        return f"OPEN (blocking for {remaining:.0f}s, failures: {self.failure_count})"
 
-            elapsed = time.time() - self.open_time
-            remaining = max(0, open_duration - elapsed)
-            return f"OPEN (blocking for {remaining:.0f}s, {self.failure_count} failures)"
-        else:
-            return f"HALF_OPEN (testing, {self.failure_count} failures)"
+
+# ---------------------------------------------------------------------------
+# The device
+# ---------------------------------------------------------------------------
 
 
 class EM1003Device:
-    """Representation of an EM1003 BLE device."""
+    """One EM1003 peripheral, with exclusive access to its BLE link."""
 
-    def __init__(self, hass: HomeAssistant, mac_address: str, device_name: str | None = None) -> None:
-        """Initialize the device."""
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        mac_address: str,
+        device_name: str | None = None,
+        *,
+        circuit_breaker: CircuitBreaker | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        """Initialise the device. Opens nothing."""
         self.hass = hass
         self.mac_address = mac_address
-        self.device_name = device_name or mac_address  # Use MAC as fallback
+        self.device_name = device_name or mac_address
+
+        self._clock_func = clock
+        self._lock = asyncio.Lock()
         self._client: BleakClient | None = None
-        self.sensor_data: dict[int, float | None] = {}
-        self.buzzer_state: bool | None = None  # Buzzer state (True=on, False=off, None=unknown)
         self._last_disconnect_time: float | None = None
 
-        # Request cache for matching responses to requests
-        # Key: (seq_id, sensor_id), Value: PendingRequest
+        self.sensor_data: dict[int, float | int | None] = {}
+        self.buzzer_state: bool | None = None
+
+        # (seq_id, match key) -> PendingRequest, in flight only.
         self._pending_requests: dict[tuple[int, int], PendingRequest] = {}
-        self._used_seq_ids: set[int] = set()  # Track used sequence IDs
+        self._used_seq_ids: set[int] = set()
+        self._recent_seq_ids: deque[int] = deque(maxlen=const.SEQ_ID_QUARANTINE)
 
-        # Circuit breaker to prevent request pile-up
-        self._circuit_breaker = CircuitBreaker(
-            failure_threshold=3,
-            open_duration=60.0
-        )
+        self._circuit_breaker = circuit_breaker or CircuitBreaker(clock=clock)
 
-        # Connection abort tracking for adaptive backoff
-        self._connection_abort_count = 0
-        self._last_connection_abort_time: float | None = None
+    # -- introspection ---------------------------------------------------
 
-        # Track last connection failure for fast-fail behavior
-        self._last_connection_failure_time: float | None = None
-        self._fast_fail_window = 30.0  # Seconds to fast-fail after connection failure
+    @property
+    def circuit_breaker(self) -> CircuitBreaker:
+        """The breaker guarding this device."""
+        return self._circuit_breaker
+
+    @property
+    def is_busy(self) -> bool:
+        """``True`` while a BLE session holds the lock."""
+        return self._lock.locked()
+
+    def _clock(self) -> float:
+        """Monotonic clock, injectable for tests."""
+        if self._clock_func is not None:
+            return self._clock_func()
+        return time.monotonic()
 
     def _device_id(self) -> str:
-        """Get device identifier for logging."""
+        """Identifier used in log lines."""
         if self.device_name and self.device_name != self.mac_address:
             return f"{self.device_name} ({self.mac_address})"
         return self.mac_address
 
-    def _get_random_sequence_id(self) -> int:
-        """Get a random unused sequence ID.
+    # -- sequence ids ----------------------------------------------------
 
-        Uses random IDs to avoid collisions when multiple requests are in flight.
-        Cache is limited to 256 entries (max possible sequence IDs).
-        """
-        # Clean up old sequence IDs if cache is getting full
-        if len(self._used_seq_ids) >= 250:
-            _LOGGER.debug(
-                "[SEQ] Cache nearly full (%d), clearing old sequence IDs",
-                len(self._used_seq_ids)
-            )
-            self._used_seq_ids.clear()
-
-        # Try to find an unused random sequence ID
-        for attempt in range(100):
-            seq_id = random.randint(0, 255)
-            if seq_id not in self._used_seq_ids:
-                self._used_seq_ids.add(seq_id)
-                return seq_id
-
-        # Fallback: sequential search
-        for seq_id in range(256):
-            if seq_id not in self._used_seq_ids:
-                self._used_seq_ids.add(seq_id)
-                _LOGGER.debug("[SEQ] Used sequential fallback, seq_id=%02x", seq_id)
-                return seq_id
-
-        # Last resort: clear and start over
-        _LOGGER.warning("[SEQ] All 256 sequence IDs exhausted, clearing cache")
-        self._used_seq_ids.clear()
-        seq_id = random.randint(0, 255)
+    def _alloc_seq_id(self) -> int:
+        """Reserve a sequence id that is neither in flight nor recently used."""
+        all_ids = set(range(256))
+        candidates = all_ids - self._used_seq_ids - set(self._recent_seq_ids)
+        if not candidates:
+            candidates = all_ids - self._used_seq_ids
+        if not candidates:
+            raise BleakError("no free sequence id")
+        seq_id = random.choice(sorted(candidates))
         self._used_seq_ids.add(seq_id)
         return seq_id
 
-    def _cleanup_expired_requests(self, max_age: float = 10.0) -> None:
-        """Clean up expired pending requests.
+    def _release_seq_id(self, seq_id: int) -> None:
+        """Return a sequence id to the pool, quarantining it for a while."""
+        self._used_seq_ids.discard(seq_id)
+        self._recent_seq_ids.append(seq_id)
 
-        Args:
-            max_age: Maximum age in seconds for a pending request
-        """
-        now = time.time()
-        expired_keys = [
-            key for key, req in self._pending_requests.items()
-            if now - req.timestamp > max_age
-        ]
+    # -- pending requests -------------------------------------------------
 
-        for key in expired_keys:
-            seq_id, sensor_id = key
-            req = self._pending_requests.pop(key)
-            self._used_seq_ids.discard(seq_id)
-            if not req.future.done():
-                req.future.cancel()
-            _LOGGER.debug(
-                "[CACHE] Cleaned up expired request: seq=%02x, sensor=%02x (age=%.1fs)",
-                seq_id, sensor_id, now - req.timestamp
-            )
+    def _discard_pending(self, key: tuple[int, int]) -> None:
+        """Drop one pending request and free its sequence id."""
+        request = self._pending_requests.pop(key, None)
+        self._release_seq_id(key[0])
+        if request is not None and not request.future.done():
+            request.future.cancel()
 
-    async def _ensure_connection_delay(self) -> None:
-        """Ensure sufficient delay since last disconnect to avoid connection issues.
+    def _fail_pending(self, message: str) -> None:
+        """Fail every in-flight request at once (disconnect / session end)."""
+        if not self._pending_requests:
+            return
+        requests = list(self._pending_requests.values())
+        self._pending_requests.clear()
+        for request in requests:
+            self._release_seq_id(request.seq_id)
+            future = request.future
+            if future.done():
+                continue
+            future.set_exception(BleakError(message))
+            # Mark the exception as retrieved: nobody may be waiting any more.
+            if not future.cancelled():
+                future.exception()
 
-        Uses adaptive backoff based on recent connection abort errors:
-        - Base delay: 2 seconds (increased from 1 to give Bluetooth stack more time)
-        - After connection abort: adds exponential backoff
-        - Resets abort count after 5 minutes of no abort errors
-        """
-        current_time = time.time()
+    # -- callbacks --------------------------------------------------------
 
-        # Reset connection abort counter if it's been a while since last abort
-        if self._last_connection_abort_time is not None:
-            time_since_abort = current_time - self._last_connection_abort_time
-            if time_since_abort > 300:  # 5 minutes
-                self._connection_abort_count = 0
-                self._last_connection_abort_time = None
-
-        # Calculate base delay with adaptive backoff for connection aborts
-        base_delay = 2.0  # Increased from 1.0 to 2.0 seconds
-
-        # Add exponential backoff for repeated connection aborts
-        # abort_count: 0 → 0s, 1 → 2s, 2 → 4s, 3 → 8s, 4 → 16s, max 30s
-        abort_backoff = 0.0
-        if self._connection_abort_count > 0:
-            abort_backoff = min(2.0 ** self._connection_abort_count, 30.0)
-
-        min_delay = base_delay + abort_backoff
-
-        # Wait if we recently disconnected
-        if self._last_disconnect_time is not None:
-            time_since_disconnect = current_time - self._last_disconnect_time
-            if time_since_disconnect < min_delay:
-                delay = min_delay - time_since_disconnect
-                if abort_backoff > 0:
-                    _LOGGER.info("Waiting %.1fs before retry (connection abort backoff)", delay)
-                await asyncio.sleep(delay)
-        elif abort_backoff > 0:
-            # No recent disconnect but we have abort history, add safety delay
-            _LOGGER.info("Waiting %.1fs before retry (connection abort backoff)", abort_backoff)
-            await asyncio.sleep(abort_backoff)
-
-    async def _establish_connection(self) -> BleakClient:
-        """Establish a connection to the device with proper error handling.
-
-        Returns:
-            Connected BleakClient instance
-
-        Raises:
-            BleakError: If connection fails after retries
-        """
-        _LOGGER.debug(
-            "[DIAG] Starting connection attempt to %s",
-            self.mac_address
-        )
-
-        # Wait if we recently disconnected to avoid connection abort errors
-        await self._ensure_connection_delay()
-
-        # Get device from Home Assistant's Bluetooth integration
-        _LOGGER.info(
-            "[DIAG] Getting device %s from Home Assistant Bluetooth integration...",
-            self._device_id()
-        )
-
-        device = bluetooth.async_ble_device_from_address(
-            self.hass,
-            self.mac_address,
-            connectable=True
-        )
-
-        if not device:
-            _LOGGER.error(
-                "[DIAG] ✗ Device %s not found",
-                self._device_id()
-            )
-            raise BleakError(
-                f"Device not found: {self.mac_address}. "
-                "Make sure device is powered on and nearby."
-            )
-
-        device_rssi = getattr(device, 'rssi', None)
-        _LOGGER.info(
-            "[DIAG] ✓ Found device %s (Name: %s, RSSI: %s dBm)",
-            self.mac_address,
-            device.name or "Unknown",
-            device_rssi if device_rssi is not None else "N/A"
-        )
-
-        # Establish connection with timeout and retry logic
-        # CRITICAL: Use max_attempts=1 to prevent slot exhaustion
-        # Each failed attempt can occupy a BLE slot that doesn't get released immediately
-        # Multiple retries can exhaust all available slots, preventing new connections
-        _LOGGER.debug(
-            "[DIAG] Attempting to establish connection to %s using bleak-retry-connector...",
-            self.mac_address
-        )
-
-        connection_start_time = time.time()
-        client = None
+    def _notification_handler(self, sender: Any, data: bytearray) -> None:
+        """Route one notification to its waiter. Sync, never raises."""
         try:
-            _LOGGER.info(
-                "[CONN_ROOT_CAUSE] Starting connection attempt to %s (RSSI: %s)",
-                self.mac_address, getattr(device, 'rssi', 'N/A')
-            )
+            frame = bytes(data)
+            key = match_key(frame)
+            if key is None:
+                _LOGGER.debug("[RX] Ignoring frame: %s", frame.hex())
+                return
 
-            client = await establish_connection(
-                BleakClient,
-                device,
-                self.mac_address,
-                disconnected_callback=lambda _: None,
-                max_attempts=1,  # CRITICAL: Reduced to 1 to prevent slot exhaustion
-                timeout=30.0,  # 30 second timeout per attempt
-            )
+            request = self._pending_requests.get(key)
+            if request is None:
+                _LOGGER.debug(
+                    "[RX] Unexpected response (seq=0x%02x, key=0x%02x)", key[0], key[1]
+                )
+                return
 
-            connection_duration = time.time() - connection_start_time
-            _LOGGER.info(
-                "[CONN_ROOT_CAUSE] ✓ Connection successful to %s (took %.2fs)",
-                self.mac_address, connection_duration
-            )
+            if frame[1] == CMD_BUZZER and len(frame) >= 4:
+                self.buzzer_state = frame[3] == BUZZER_ON
 
-            # Reset connection abort tracking on successful connection
-            if self._connection_abort_count > 0:
-                self._connection_abort_count = 0
-                self._last_connection_abort_time = None
+            self._pending_requests.pop(key, None)
+            self._release_seq_id(key[0])
+            if not request.future.done():
+                request.future.set_result(frame)
+            _LOGGER.debug("[RX] %s", frame.hex(" "))
+        except Exception as err:  # noqa: BLE001 - a callback must never propagate
+            _LOGGER.error("[RX] Error handling notification: %s", err)
 
-            return client
+    def _handle_disconnect(self, client: Any) -> None:
+        """Bleak disconnect callback: fail everything in flight immediately."""
+        if client is not self._client:
+            # A link we no longer own; its waiters are already gone.
+            return
+        self._last_disconnect_time = self._clock()
+        _LOGGER.debug("[CONN] %s dropped the link", self._device_id())
+        self._fail_pending("device disconnected")
 
-        except Exception as conn_err:
-            # CRITICAL: Clean up any partially established connection
-            # Failed connection attempts can leave slots occupied
-            if client is not None:
+    # -- session machinery -------------------------------------------------
+
+    async def _async_wait_reconnect_guard(self) -> None:
+        """Give the controller a moment between our disconnect and next connect."""
+        if self._last_disconnect_time is None:
+            return
+        remaining = const.BLE_RECONNECT_GUARD - (self._clock() - self._last_disconnect_time)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+    async def _async_connect(self) -> BleakClient:
+        """Look the device up in HA and open one link to it, bounded."""
+        ble_device = bluetooth.async_ble_device_from_address(
+            self.hass, self.mac_address, connectable=True
+        )
+        if not ble_device:
+            raise BleakError(f"Device not found: {self.mac_address}")
+
+        try:
+            async with asyncio.timeout(const.BLE_CONNECT_TIMEOUT):
+                # BleakClientWithServiceCache (a BleakClient subclass) is the
+                # class HA recommends: it is the only one bleak-retry-connector
+                # will call clear_cache() on when a stale GATT cache makes the
+                # connect raise KeyError, so a device whose GATT table changed
+                # self-heals instead of failing every poll until HA restarts.
+                return await establish_connection(
+                    BleakClientWithServiceCache,
+                    ble_device,
+                    self.mac_address,
+                    disconnected_callback=self._handle_disconnect,
+                    max_attempts=1,
+                    timeout=const.BLE_CONNECT_TIMEOUT,
+                )
+        except TimeoutError as err:
+            raise BleakError(f"Connection to {self.mac_address} timed out") from err
+
+    async def _async_teardown(self, client: Any, notify_started: bool) -> None:
+        """Close one link. Swallows everything, bounded at every step."""
+        try:
+            self._fail_pending("session ended")
+            # Nothing can be in flight outside a session.
+            self._used_seq_ids.clear()
+
+            if notify_started:
                 try:
-                    _LOGGER.debug(
-                        "[CONN_ROOT_CAUSE] Cleaning up failed connection attempt to %s",
-                        self.mac_address
-                    )
+                    async with asyncio.timeout(const.BLE_STOP_NOTIFY_TIMEOUT):
+                        await client.stop_notify(EM1003_NOTIFY_CHAR_UUID)
+                except TimeoutError:
+                    _LOGGER.debug("[CONN] stop_notify timed out for %s", self.mac_address)
+                except Exception as err:  # noqa: BLE001 - best effort
+                    _LOGGER.debug("[CONN] stop_notify failed for %s: %s", self.mac_address, err)
+
+            try:
+                async with asyncio.timeout(const.BLE_DISCONNECT_TIMEOUT):
                     await client.disconnect()
-                except Exception as cleanup_err:
-                    _LOGGER.debug(
-                        "[CONN_ROOT_CAUSE] Error during connection cleanup: %s",
-                        cleanup_err
-                    )
-            connection_duration = time.time() - connection_start_time
-
-            # Analyze the error to determine root cause
-            error_message = str(conn_err).lower()
-            error_type = type(conn_err).__name__
-
-            # Categorize the error
-            is_connection_abort = (
-                "connection abort" in error_message or
-                "software caused connection abort" in error_message
-            )
-            is_timeout = "timeout" in error_message or isinstance(conn_err, asyncio.TimeoutError)
-            is_device_unreachable = (
-                "device unreachable" in error_message or
-                "no route to host" in error_message or
-                "host is down" in error_message
-            )
-            is_auth_failed = (
-                "authentication" in error_message or
-                "pairing" in error_message
-            )
-            is_resource_busy = (
-                "resource busy" in error_message or
-                "device busy" in error_message
-            )
-
-            # Build diagnostic context
-            device_rssi = getattr(device, 'rssi', None)
-            device_name = getattr(device, 'name', 'Unknown')
-
-            # Log detailed root cause analysis
-            _LOGGER.error(
-                "[CONN_ROOT_CAUSE] ✗ Connection FAILED to %s after %.2fs",
-                self.mac_address, connection_duration
-            )
-            _LOGGER.error(
-                "[CONN_ROOT_CAUSE] Error type: %s", error_type
-            )
-            _LOGGER.error(
-                "[CONN_ROOT_CAUSE] Error message: %s", conn_err
-            )
-            _LOGGER.error(
-                "[CONN_ROOT_CAUSE] Device info: name=%s, RSSI=%s",
-                device_name, device_rssi
-            )
-
-            # Determine and log the root cause
-            if is_connection_abort:
-                self._connection_abort_count += 1
-                self._last_connection_abort_time = time.time()
-                _LOGGER.error(
-                    "[CONN_ROOT_CAUSE] Root cause: CONNECTION ABORT - "
-                    "Bluetooth stack aborted connection (count: %d). "
-                    "Possible reasons: device too far, interference, device busy, or Bluetooth stack overload",
-                    self._connection_abort_count
+            except TimeoutError:
+                _LOGGER.warning(
+                    "[CONN] Disconnect from %s timed out, dropping the link reference",
+                    self.mac_address,
                 )
-            elif is_timeout:
-                _LOGGER.error(
-                    "[CONN_ROOT_CAUSE] Root cause: TIMEOUT - "
-                    "Device did not respond within 30s. "
-                    "Possible reasons: device out of range (RSSI: %s), device sleeping, "
-                    "or device not advertising",
-                    device_rssi
-                )
-            elif is_device_unreachable:
-                _LOGGER.error(
-                    "[CONN_ROOT_CAUSE] Root cause: DEVICE UNREACHABLE - "
-                    "Device cannot be reached. "
-                    "Possible reasons: device powered off, out of range (RSSI: %s), "
-                    "or Bluetooth adapter issue",
-                    device_rssi
-                )
-            elif is_auth_failed:
-                _LOGGER.error(
-                    "[CONN_ROOT_CAUSE] Root cause: AUTHENTICATION/PAIRING FAILED - "
-                    "Device rejected pairing or authentication. "
-                    "Possible reasons: device requires pairing, incorrect PIN, or bonding issue"
-                )
-            elif is_resource_busy:
-                _LOGGER.error(
-                    "[CONN_ROOT_CAUSE] Root cause: RESOURCE BUSY - "
-                    "Bluetooth resource is busy. "
-                    "Possible reasons: another process connected to device, "
-                    "Bluetooth adapter busy, or previous connection not fully closed"
-                )
-            else:
-                _LOGGER.error(
-                    "[CONN_ROOT_CAUSE] Root cause: UNKNOWN ERROR - "
-                    "Unexpected error during connection. "
-                    "Check device status, Bluetooth adapter, and system logs",
-                    exc_info=True
-                )
+            except Exception as err:  # noqa: BLE001 - best effort
+                _LOGGER.debug("[CONN] Disconnect from %s failed: %s", self.mac_address, err)
+        finally:
+            # Identity-guarded so a teardown that outlived its session (only
+            # possible if we were cancelled twice) cannot clear a newer link.
+            if self._client is client:
+                self._client = None
+            self._last_disconnect_time = self._clock()
 
-            # Log environmental factors
-            if device_rssi is not None:
-                if device_rssi < -90:
-                    _LOGGER.warning(
-                        "[CONN_ROOT_CAUSE] ⚠ Signal strength VERY WEAK (RSSI: %s dBm). "
-                        "Device is likely too far away or obstructed",
-                        device_rssi
-                    )
-                elif device_rssi < -80:
-                    _LOGGER.warning(
-                        "[CONN_ROOT_CAUSE] ⚠ Signal strength WEAK (RSSI: %s dBm). "
-                        "Connection may be unreliable",
-                        device_rssi
-                    )
-                elif device_rssi < -70:
-                    _LOGGER.info(
-                        "[CONN_ROOT_CAUSE] Signal strength FAIR (RSSI: %s dBm)",
-                        device_rssi
-                    )
-                else:
-                    _LOGGER.info(
-                        "[CONN_ROOT_CAUSE] Signal strength GOOD (RSSI: %s dBm)",
-                        device_rssi
-                    )
-
-            # Log recommended actions
-            _LOGGER.error(
-                "[CONN_ROOT_CAUSE] Recommended actions: "
-                "1) Check device is powered on and nearby, "
-                "2) Check for Bluetooth interference, "
-                "3) Restart Bluetooth adapter if issues persist, "
-                "4) Check Home Assistant Bluetooth integration logs"
-            )
-
+    async def _async_close(self, client: Any, notify_started: bool) -> None:
+        """Run the teardown so that it finishes even if we are cancelled."""
+        task = asyncio.ensure_future(self._async_teardown(client, notify_started))
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.wait({task})
             raise
+        except Exception as err:  # noqa: BLE001 - teardown swallows its own errors
+            _LOGGER.debug("[CONN] Teardown error for %s: %s", self.mac_address, err)
 
-    async def _ensure_connected(self) -> BleakClient:
-        """Ensure we have an active connection, reusing existing if possible.
+    async def _async_session(
+        self,
+        body: Callable[[Any], Awaitable[Any]],
+        *,
+        notify: bool = False,
+        gate: str = _GATE_NONE,
+        timeout: float | None = None,
+        raise_errors: bool = False,
+        outcome_fn: Callable[[], bool] | None = None,
+    ) -> _SessionResult:
+        """Run ``body(client)`` as the only BLE activity on this device.
 
-        This method prioritizes reusing existing connections:
-        1. If self._client exists and is connected, use it immediately
-        2. Otherwise, establish a new connection via active BLE scanning
-
-        Returns:
-            Connected BleakClient instance
-
-        Raises:
-            BleakError: If connection fails or fast-fail is active
+        Serialised by ``self._lock``; the link created here is always closed
+        here, even on cancellation or a blown deadline.
         """
-        # PRIORITY 1: Check if we already have a valid connection
-        if self._client and self._client.is_connected:
-            _LOGGER.info(
-                "[CONN] ✓ Reusing existing active connection to %s",
-                self.mac_address
-            )
-            return self._client
+        failure: Exception | None = None
+        cancelled = False
 
-        _LOGGER.debug(
-            "[CONN] No active connection to %s, need to establish new connection",
-            self.mac_address
-        )
+        async with self._lock:
+            admitted = True
+            reason = "closed"
+            if gate != _GATE_NONE:
+                admitted, reason = self._circuit_breaker.can_attempt()
+                if not admitted and gate == _GATE_CHECK:
+                    _LOGGER.debug("[CIRCUIT] %s blocked: %s", self._device_id(), reason)
+                    return _SessionResult(admitted=False, rejected_reason=reason)
 
-        # Fast-fail if we recently failed to connect (unless circuit breaker is testing)
-        if self._last_connection_failure_time is not None:
-            time_since_failure = time.time() - self._last_connection_failure_time
+            value: Any = None
+            client: Any = None
+            notify_started = False
 
-            # Only fast-fail if we're not in HALF_OPEN state (testing phase)
-            if time_since_failure < self._fast_fail_window and self._circuit_breaker.state != "HALF_OPEN":
-                remaining = self._fast_fail_window - time_since_failure
-                _LOGGER.debug(
-                    "[CONN] Fast-fail: Recent connection failure (%.0fs ago), "
-                    "skipping connection attempt for %.0fs more",
-                    time_since_failure, remaining
-                )
-                raise BleakError(
-                    f"Fast-fail: Connection failed {time_since_failure:.0f}s ago, "
-                    f"will retry after {remaining:.0f}s"
-                )
-
-        # PRIORITY 2: Need to establish a new connection via active BLE scanning
-        _LOGGER.info(
-            "[CONN] Establishing new connection to %s via active BLE scan",
-            self.mac_address
-        )
-
-        try:
-            self._client = await self._establish_connection()
-
-            # Subscribe to notifications (only need to do this once per connection)
             try:
-                await self._client.start_notify(EM1003_NOTIFY_CHAR_UUID, self._notification_handler)
-                _LOGGER.debug("[CONN] ✓ Connected and subscribed to %s", self.mac_address)
-
-                # Connection successful - clear failure timestamp
-                self._last_connection_failure_time = None
-
-            except Exception as err:
-                # Failed to subscribe, disconnect and re-raise
-                _LOGGER.error("[CONN] Failed to subscribe to notifications: %s", err)
-                # CRITICAL: Ensure connection is properly cleaned up to free slot
-                if self._client is not None:
+                try:
                     try:
-                        await self._client.disconnect()
-                        _LOGGER.debug("[CONN] Disconnected after subscription failure to free slot")
-                    except Exception as disconnect_err:
-                        _LOGGER.debug("[CONN] Error during cleanup disconnect: %s", disconnect_err)
-                self._client = None
-                # Record failure timestamp
-                self._last_connection_failure_time = time.time()
-                raise
-
-            return self._client
-
-        except Exception as err:
-            # Record failure timestamp for fast-fail
-            self._last_connection_failure_time = time.time()
-            # CRITICAL: Ensure client is cleared so it doesn't hold a stale connection
-            if self._client is not None:
-                try:
-                    await self._client.disconnect()
-                    _LOGGER.debug("[CONN] Disconnected after connection error to free slot")
-                except Exception:
-                    pass
-                self._client = None
-            raise
-
-    async def disconnect(self) -> None:
-        """Explicitly disconnect from the device."""
-        if self._client and self._client.is_connected:
-            try:
-                # Stop notifications first
-                try:
-                    await self._client.stop_notify(EM1003_NOTIFY_CHAR_UUID)
-                    _LOGGER.debug("[CONN] Stopped notifications for %s", self.mac_address)
-                except Exception as err:
-                    _LOGGER.debug("[CONN] Could not stop notifications: %s", err)
-
-                # Disconnect
-                await self._client.disconnect()
-                _LOGGER.debug("[CONN] Disconnected from %s", self.mac_address)
-            except Exception as err:
-                _LOGGER.debug("[CONN] Error during disconnect: %s", err)
-            finally:
-                self._client = None
-                self._last_disconnect_time = time.time()
-        else:
-            _LOGGER.debug("[CONN] Already disconnected from %s", self.mac_address)
-            self._client = None
-
-    def _notification_handler(self, sender, data: bytearray) -> None:
-        """Handle notification from device.
-
-        Validates response matches pending request by checking (seq_id, sensor_id).
-        This prevents accepting wrong responses due to timing issues.
-        """
-        try:
-            if len(data) < 3:
-                _LOGGER.warning("[RX] Notification too short: %d bytes, raw: %s", len(data), data.hex())
-                return
-
-            seq_id = data[0]
-            cmd_type = data[1]
-            sensor_id = data[2]
-            value_bytes = data[3:]
-
-            # Handle buzzer set response (0x05)
-            if cmd_type == CMD_BUZZER_SET_RESPONSE:
-                hex_parts = ' '.join([f'{b:02x}' for b in data])
-                _LOGGER.debug(
-                    "[RX] (蜂鸣器设置响应)[0x %s] len=%d",
-                    hex_parts, len(data)
-                )
-
-                # Find matching pending request
-                # For set operations, we use sensor_id 0x01
-                request_key = (seq_id, 0x01)
-                pending_request = self._pending_requests.get(request_key)
-
-                if not pending_request:
-                    _LOGGER.warning(
-                        "[RX] ✗ Buzzer set: Unexpected response (seq=0x%02x, no matching request)",
-                        seq_id
-                    )
-                    return
-
-                _LOGGER.info(
-                    "[RESP] ✓ Buzzer set command acknowledged"
-                )
-
-                # Complete the future
-                if not pending_request.future.done():
-                    pending_request.future.set_result(data)
-
-                del self._pending_requests[request_key]
-                self._used_seq_ids.discard(seq_id)
-                return
-
-            # Handle buzzer query response (0x50)
-            if cmd_type == CMD_BUZZER:
-                hex_parts = ' '.join([f'{b:02x}' for b in data])
-                _LOGGER.debug(
-                    "[RX] (蜂鸣器响应)[0x %s] len=%d, sensor_id=0x%02x, value_bytes=%s",
-                    hex_parts, len(data), sensor_id, value_bytes.hex() if value_bytes else "empty"
-                )
-
-                # Find matching pending request
-                request_key = (seq_id, sensor_id)
-                pending_request = self._pending_requests.get(request_key)
-
-                if not pending_request:
-                    _LOGGER.warning(
-                        "[RX] ✗ Buzzer: Unexpected response (seq=0x%02x, sensor_id=0x%02x, no matching request)",
-                        seq_id, sensor_id
-                    )
-                    return
-
-                # Parse buzzer state from response
-                # Response format: [seq_id][0x50][0x00][state]
-                if len(value_bytes) >= 1:
-                    buzzer_value = value_bytes[0]
-                    self.buzzer_state = (buzzer_value == BUZZER_ON)
-                    _LOGGER.info(
-                        "[RESP] ✓ Buzzer state = %s (0x%02x)",
-                        "ON" if self.buzzer_state else "OFF",
-                        buzzer_value
-                    )
-                else:
-                    _LOGGER.warning(
-                        "[RX] ✗ Buzzer: Response too short (len=%d, expected >= 4 bytes)",
-                        len(data)
-                    )
-
-                # Complete the future
-                if not pending_request.future.done():
-                    pending_request.future.set_result(data)
-
-                del self._pending_requests[request_key]
-                self._used_seq_ids.discard(seq_id)
-                return
-
-            # Get sensor name for logging
-            sensor_info = SENSOR_TYPES.get(sensor_id, {})
-            sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
-
-            # Format: (设备响应)[0x seq-cmd-sensor-value...] 实体XX 传感器名
-            hex_parts = ' '.join([f'{b:02x}' for b in data])
-            _LOGGER.debug(
-                "[RX] (设备响应)[0x %s] 实体%02x %s",
-                hex_parts, sensor_id, sensor_name
-            )
-
-
-            # Find matching pending request using (seq_id, sensor_id) key
-            request_key = (seq_id, sensor_id)
-            pending_request = self._pending_requests.get(request_key)
-
-            if not pending_request:
-                _LOGGER.warning(
-                    "[RX] ✗ %s: Unexpected response (seq=0x%02x, no matching request)",
-                    sensor_name, seq_id
-                )
-                return
-
-            # Parse value based on sensor type
-            # Value is in little-endian format (e.g., 0x31 0x00 = 49)
-            if len(value_bytes) >= 2:
-                raw_value = int.from_bytes(value_bytes[:2], byteorder='little')
-
-                # Apply sensor-specific scaling and offsets
-                formula_desc = ""
-                calculated_value = None
-
-                if sensor_id == 0x01:
-                    # Temperature: (raw - 4000) / 100
-                    calculated_value = (raw_value - 4000) / 100.0
-                    formula_desc = f"({raw_value} - 4000) / 100"
-                elif sensor_id == 0x06:
-                    # Humidity: raw / 100
-                    calculated_value = raw_value / 100.0
-                    formula_desc = f"{raw_value} / 100"
-                elif sensor_id == 0x0A:
-                    # Formaldehyde: (raw - 16384) / 1000
-                    calculated_value = (raw_value - 16384) / 1000.0
-                    formula_desc = f"({raw_value} - 16384) / 1000"
-                elif sensor_id in [0x08, 0x09, 0x11, 0x12, 0x13]:
-                    # Noise, PM2.5, PM10, TVOC, eCO2: raw value directly
-                    calculated_value = raw_value
-                    formula_desc = f"{raw_value} (direct)"
-                else:
-                    # Other sensors use raw value directly (Noise, etc.)
-                    calculated_value = raw_value
-                    formula_desc = f"{raw_value} (direct)"
-
-                # Filter out negative values for specific sensors
-                # Skip data if negative for: Humidity, Noise, PM2.5, Formaldehyde, PM10, TVOC, eCO2
-                if sensor_id in [0x06, 0x08, 0x09, 0x0A, 0x11, 0x12, 0x13] and calculated_value < 0:
-                    _LOGGER.warning(
-                        "[FILTER] ✗ %s (0x%02x): Skipping negative value %s (formula: %s)",
-                        sensor_name, sensor_id, calculated_value, formula_desc
-                    )
-                    # Don't update sensor_data, effectively skipping this reading
-                else:
-                    # Only store valid (non-negative) values
-                    self.sensor_data[sensor_id] = calculated_value
-
-                unit = sensor_info.get("unit", "")
-                final_value = self.sensor_data.get(sensor_id)
-
-                # Format: 解析: 字节XX → 原始值N → 公式[...] → 最终值V 单位
-                value_hex = ' '.join([f'{b:02x}' for b in value_bytes[:2]])
-                _LOGGER.debug(
-                    "[RX] 解析: 字节[%s] → 原始值%d → 公式[%s] → 最终值%s %s",
-                    value_hex, raw_value, formula_desc, final_value, unit
-                )
-
-                _LOGGER.info(
-                    "[RESP] ✓ %s (0x%02x) = %s %s",
-                    sensor_name, sensor_id, final_value, unit
-                )
-            else:
-                _LOGGER.warning(
-                    "[RX] ✗ %s: Value too short (got %d bytes, need at least 2)",
-                    sensor_name, len(value_bytes)
-                )
-
-            # Complete the future and remove from pending requests
-            if not pending_request.future.done():
-                pending_request.future.set_result(data)
-
-            del self._pending_requests[request_key]
-            self._used_seq_ids.discard(seq_id)
-            _LOGGER.debug(
-                "[CACHE] Removed completed request (seq=%02x, sensor=%02x). "
-                "Pending: %d, Used seq_ids: %d",
-                seq_id, sensor_id, len(self._pending_requests), len(self._used_seq_ids)
-            )
-
-        except Exception as err:
-            _LOGGER.error("Error handling notification: %s", err, exc_info=True)
-
-    async def read_sensor(self, sensor_id: int) -> float | None:
-        """Read a specific sensor value.
-
-        Args:
-            sensor_id: Sensor ID to read
-
-        Returns:
-            Sensor value or None if reading fails
-        """
-        # Check circuit breaker
-        can_attempt, reason = self._circuit_breaker.can_attempt()
-        if not can_attempt:
-            _LOGGER.warning(
-                "[CIRCUIT] Blocked read_sensor for 0x%02x: %s",
-                sensor_id, reason
-            )
-            return None
-
-        # Clean up expired requests
-        self._cleanup_expired_requests()
-
-        try:
-            # Ensure connection (will reuse existing or create new)
-            client = await self._ensure_connected()
-
-            # Prepare request with random sequence ID
-            seq_id = self._get_random_sequence_id()
-            request = bytes([seq_id, CMD_READ_SENSOR, sensor_id])
-
-            # Get sensor name for logging
-            sensor_info = SENSOR_TYPES.get(sensor_id, {})
-            sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
-
-            # Format: (请求传感器数据)[0x seq-cmd-sensor] 实体XX 传感器名
-            hex_parts = ' '.join([f'{b:02x}' for b in request])
-            _LOGGER.debug(
-                "[TX] (请求传感器数据)[0x %s] 实体%02x %s",
-                hex_parts, sensor_id, sensor_name
-            )
-
-            # Create pending request and add to cache
-            pending_request = PendingRequest(
-                seq_id=seq_id,
-                sensor_id=sensor_id,
-                future=asyncio.Future(),
-                timestamp=time.time()
-            )
-            request_key = (seq_id, sensor_id)
-            self._pending_requests[request_key] = pending_request
-
-            # Send request
-            await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
-
-            # Wait for response with timeout
-            try:
-                await asyncio.wait_for(pending_request.future, timeout=2.0)
-                value = self.sensor_data.get(sensor_id)
-                self._circuit_breaker.record_success()
-                return value
-            except asyncio.TimeoutError:
-                _LOGGER.warning(
-                    "Timeout waiting for sensor 0x%02x response (seq=%02x)",
-                    sensor_id, seq_id
-                )
-                # Clean up pending request
-                self._pending_requests.pop(request_key, None)
-                self._used_seq_ids.discard(seq_id)
-                self._circuit_breaker.record_failure()
-                return None
-
-        except BleakError as err:
-            _LOGGER.error("Bleak error reading sensor %02x: %s", sensor_id, err)
-            self._circuit_breaker.record_failure()
-            # Clear client so next attempt will create new connection
-            self._client = None
-            return None
-        except Exception as err:
-            _LOGGER.error("Error reading sensor %02x: %s", sensor_id, err, exc_info=True)
-            self._circuit_breaker.record_failure()
-            # Clear client so next attempt will create new connection
-            self._client = None
-            return None
-
-    async def read_all_sensors(self) -> dict[int, float | None]:
-        """Read all sensors using persistent connection.
-
-        Uses circuit breaker pattern to prevent request pile-up during failures.
-        Uses request cache to match responses to requests by (seq_id, sensor_id).
-        Maintains a persistent BLE connection that is reused across multiple reads.
-
-        Returns:
-            Dictionary mapping sensor IDs to their values
-        """
-        _LOGGER.debug("[DIAG] read_all_sensors called for %s", self.mac_address)
-        results = {}
-
-        # Check circuit breaker before attempting connection
-        can_attempt, reason = self._circuit_breaker.can_attempt()
-        if not can_attempt:
-            _LOGGER.warning(
-                "[CIRCUIT] Blocked read_all_sensors: %s. State: %s",
-                reason,
-                self._circuit_breaker.get_state_info()
-            )
-            # Return None for all sensors when circuit is open
-            return {sensor_id: None for sensor_id in SENSOR_TYPES.keys()}
-
-        _LOGGER.debug(
-            "[CIRCUIT] Attempt allowed: %s. State: %s",
-            reason,
-            self._circuit_breaker.get_state_info()
-        )
-
-        # Clean up any expired requests before starting
-        self._cleanup_expired_requests()
-
-        try:
-            # Ensure connection (will reuse existing or create new)
-            _LOGGER.debug("[CONN] Ensuring connection to %s", self.mac_address)
-            client = await self._ensure_connected()
-
-            _LOGGER.info(
-                "[DIAG] Using connection to %s, starting sensor reads",
-                self.mac_address
-            )
-
-            # Read all sensors using the persistent connection
-            sensor_count = len(SENSOR_TYPES)
-            _LOGGER.debug(
-                "[DIAG] Reading %d sensors: %s",
-                sensor_count,
-                [f"0x{sid:02x}" for sid in SENSOR_TYPES.keys()]
-            )
-
-            for idx, sensor_id in enumerate(SENSOR_TYPES.keys(), 1):
-                # Check if connection is still valid before each read
-                if not client.is_connected:
-                    _LOGGER.warning(
-                        "[REQ] [%d/%d] Connection lost, aborting remaining sensor reads",
-                        idx, sensor_count
-                    )
-                    # Mark remaining sensors as None
-                    for remaining_id in list(SENSOR_TYPES.keys())[idx-1:]:
-                        results[remaining_id] = None
-                    break
-
-                try:
-                    # Get random sequence ID to avoid collisions
-                    seq_id = self._get_random_sequence_id()
-                    request = bytes([seq_id, CMD_READ_SENSOR, sensor_id])
-
-                    # Get sensor name for logging
-                    sensor_info = SENSOR_TYPES.get(sensor_id, {})
-                    sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
-
-                    if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                        _LOGGER.info(
-                            "[%s] Requesting sensor 0x%02x (seq=%02x)",
-                            sensor_name, sensor_id, seq_id
-                        )
-
-                    # Format: (请求传感器数据)[0x seq-cmd-sensor] 实体XX 传感器名
-                    hex_parts = ' '.join([f'{b:02x}' for b in request])
-                    _LOGGER.debug(
-                        "[TX] [%d/%d] (请求传感器数据)[0x %s] 实体%02x %s",
-                        idx, sensor_count, hex_parts, sensor_id, sensor_name
-                    )
-
-                    # Create pending request and add to cache
-                    pending_request = PendingRequest(
-                        seq_id=seq_id,
-                        sensor_id=sensor_id,
-                        future=asyncio.Future(),
-                        timestamp=time.time()
-                    )
-                    request_key = (seq_id, sensor_id)
-                    self._pending_requests[request_key] = pending_request
-
-
-                    # Send request
-                    await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
-
-
-                    # Wait for response with timeout
-                    try:
-                        await asyncio.wait_for(pending_request.future, timeout=2.0)
-                        # Get parsed value from sensor_data (set by notification handler)
-                        value = self.sensor_data.get(sensor_id)
-                        results[sensor_id] = value
-
-                        if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                            _LOGGER.info(
-                                "[%s] ✓ Got value: %s",
-                                sensor_name, value
-                            )
-
-                        _LOGGER.debug(
-                            "[REQ] [%d/%d] ✓ Sensor 0x%02x = %s",
-                            idx, sensor_count, sensor_id, value
-                        )
-                    except asyncio.TimeoutError:
-                        if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                            _LOGGER.warning(
-                                "[%s] ✗ TIMEOUT (2s) - sensor 0x%02x not responding",
-                                sensor_name, sensor_id
-                            )
+                        async with asyncio.timeout(
+                            const.BLE_SESSION_TIMEOUT if timeout is None else timeout
+                        ):
+                            await self._async_wait_reconnect_guard()
+                            client = await self._async_connect()
+                            self._client = client
+
+                            if notify:
+                                try:
+                                    async with asyncio.timeout(const.BLE_START_NOTIFY_TIMEOUT):
+                                        await client.start_notify(
+                                            EM1003_NOTIFY_CHAR_UUID, self._notification_handler
+                                        )
+                                except TimeoutError as err:
+                                    raise BleakError(
+                                        f"start_notify on {self.mac_address} timed out"
+                                    ) from err
+                                notify_started = True
+
+                            value = await body(client)
+                    finally:
+                        # The link this session created is always closed here,
+                        # whatever happened above - cancellation included.
+                        if client is not None:
+                            await self._async_close(client, notify_started)
                         else:
-                            _LOGGER.warning(
-                                "[REQ] [%d/%d] ✗ Timeout waiting for sensor 0x%02x response (seq=%02x)",
-                                idx, sensor_count, sensor_id, seq_id
-                            )
-                        results[sensor_id] = None
-                        # Clean up pending request on timeout
-                        self._pending_requests.pop(request_key, None)
-                        self._used_seq_ids.discard(seq_id)
+                            self._client = None
+                except asyncio.CancelledError:
+                    cancelled = True
+                    raise
+                except Exception as err:  # noqa: BLE001 - reported, not propagated
+                    failure = err
+                    _LOGGER.error(
+                        "[CONN] %s: BLE session failed: %s",
+                        self._device_id(),
+                        _describe_error(err),
+                    )
+            finally:
+                # Exactly one outcome per admitted call, cancellation included,
+                # so a HALF_OPEN probe slot can never stay stuck.
+                if outcome_fn is not None:
+                    success = bool(outcome_fn())
+                else:
+                    success = failure is None and not cancelled
 
-                    # Small delay between sensor reads
-                    await asyncio.sleep(0.3)
-
-                except BleakError as err:
-                    if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                        _LOGGER.error(
-                            "[%s] ✗ BLE error: %s",
-                            sensor_name, err
-                        )
+                if gate == _GATE_CHECK or (gate == _GATE_BYPASS and admitted):
+                    if success:
+                        self._circuit_breaker.record_success()
                     else:
-                        _LOGGER.error(
-                            "[REQ] [%d/%d] ✗ BLE error reading sensor 0x%02x: %s",
-                            idx, sensor_count, sensor_id, err
-                        )
-                    results[sensor_id] = None
-                    # Clean up on error
-                    request_key = (seq_id, sensor_id)
-                    self._pending_requests.pop(request_key, None)
-                    self._used_seq_ids.discard(seq_id)
+                        self._circuit_breaker.record_failure()
+                elif gate == _GATE_BYPASS and success:
+                    # A bypassed call can only help the breaker, never extend
+                    # an outage.
+                    self._circuit_breaker.record_success()
 
-                    # If we get a BLE error, connection might be broken
-                    # Check and abort if disconnected
-                    if not client.is_connected:
-                        _LOGGER.warning(
-                            "[REQ] Connection lost after BLE error, aborting remaining reads"
-                        )
-                        # Mark remaining sensors as None
-                        for remaining_id in list(SENSOR_TYPES.keys())[idx:]:
-                            results[remaining_id] = None
-                        break
-                except Exception as err:
-                    if sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                        _LOGGER.error(
-                            "[%s] ✗ Error: %s",
-                            sensor_name, err
-                        )
-                    else:
-                        _LOGGER.error(
-                            "[REQ] [%d/%d] ✗ Error reading sensor 0x%02x: %s",
-                            idx, sensor_count, sensor_id, err
-                        )
-                    results[sensor_id] = None
-                    # Clean up on error
-                    request_key = (seq_id, sensor_id)
-                    self._pending_requests.pop(request_key, None)
-                    self._used_seq_ids.discard(seq_id)
-
-            # Calculate success rate
-            success_count = sum(1 for v in results.values() if v is not None)
-
-            _LOGGER.info(
-                "[DIAG] Completed reading all sensors. Success: %d/%d",
-                success_count,
-                len(results)
+            result = _SessionResult(
+                value=value,
+                admitted=admitted,
+                rejected_reason=None if admitted else reason,
+                error=None if failure is None else _describe_error(failure),
             )
 
-            # Record success or failure to circuit breaker
-            if success_count >= len(results) * 0.5:  # At least 50% success
-                self._circuit_breaker.record_success()
-            else:
+        if failure is not None and raise_errors:
+            raise failure
+        return result
+
+    # -- request / response -------------------------------------------------
+
+    async def _async_request(
+        self,
+        client: Any,
+        payload: bytes,
+        key: int,
+        *,
+        timeout: float | None = None,
+    ) -> bytes | None:
+        """Write one frame and wait for its answer.
+
+        Returns the raw response frame, or ``None`` when the device did not
+        answer in time. Raises :class:`BleakError` when the write fails or the
+        link drops while waiting.
+        """
+        seq_id = payload[0]
+        request_key = (seq_id, key)
+        loop = asyncio.get_running_loop()
+        request = PendingRequest(
+            seq_id=seq_id,
+            sensor_id=key,
+            future=loop.create_future(),
+            timestamp=self._clock(),
+        )
+        self._pending_requests[request_key] = request
+
+        _LOGGER.debug("[TX] %s", payload.hex(" "))
+
+        try:
+            async with asyncio.timeout(const.BLE_WRITE_TIMEOUT):
+                await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, payload, response=False)
+        except BaseException as err:
+            self._discard_pending(request_key)
+            if isinstance(err, BleakError):
+                raise
+            if isinstance(err, TimeoutError):
+                raise BleakError(f"write timed out for {self.mac_address}") from err
+            if isinstance(err, Exception):
+                raise BleakError(f"write failed for {self.mac_address}: {err}") from err
+            raise
+
+        try:
+            return await asyncio.wait_for(
+                request.future,
+                const.BLE_RESPONSE_TIMEOUT if timeout is None else timeout,
+            )
+        except TimeoutError:
+            self._discard_pending(request_key)
+            _LOGGER.debug(
+                "[REQ] No response for key 0x%02x (seq=0x%02x)", key, seq_id
+            )
+            return None
+        except BaseException:
+            self._discard_pending(request_key)
+            raise
+
+    # -- operation bodies ---------------------------------------------------
+
+    async def _async_read_sensors(
+        self, client: Any, sensors: dict[int, float | int | None]
+    ) -> None:
+        """Query every sensor once on an established link, in place."""
+        sensor_ids = list(SENSOR_TYPES)
+        last_index = len(sensor_ids) - 1
+
+        for index, sensor_id in enumerate(sensor_ids):
+            if not client.is_connected:
                 _LOGGER.warning(
-                    "[CIRCUIT] Low success rate (%d/%d), recording failure",
-                    success_count, len(results)
+                    "[REQ] Link to %s lost, %d sensors not read",
+                    self.mac_address,
+                    len(sensor_ids) - index,
                 )
-                self._circuit_breaker.record_failure()
+                return
 
-            # CRITICAL: Disconnect immediately after reading to free up connection slot
-            # EM1003 device responds very fast (<2s), no need to keep connection open
-            # This prevents "No backend with an available connection slot" errors
-            if self._client and self._client.is_connected:
-                try:
-                    _LOGGER.info(
-                        "[CONN] Disconnecting after successful read to free connection slot"
-                    )
-                    await self.disconnect()
-                except Exception as disconnect_err:
+            try:
+                seq_id = self._alloc_seq_id()
+                frame = await self._async_request(
+                    client, build_sensor_request(seq_id, sensor_id), sensor_id
+                )
+            except BleakError as err:
+                _LOGGER.error(
+                    "[REQ] Sensor 0x%02x read failed on %s: %s",
+                    sensor_id,
+                    self.mac_address,
+                    err,
+                )
+                return
+
+            if frame is not None:
+                value = apply_negative_filter(
+                    sensor_id, parse_sensor_value(sensor_id, frame[3:])
+                )
+                if value is None:
                     _LOGGER.debug(
-                        "[CONN] Error during post-read disconnect: %s",
-                        disconnect_err
+                        "[FILTER] Dropped reading for sensor 0x%02x", sensor_id
                     )
+                else:
+                    self.sensor_data[sensor_id] = value
+                sensors[sensor_id] = value
 
-            return results
+            if index < last_index:
+                await asyncio.sleep(const.BLE_INTER_REQUEST_DELAY)
 
+    async def _async_query_buzzer(self, client: Any) -> bool | None:
+        """Best-effort buzzer state query on an established link."""
+        try:
+            seq_id = self._alloc_seq_id()
+            frame = await self._async_request(client, build_buzzer_query(seq_id), BUZZER_QUERY_KEY)
         except BleakError as err:
-            # Connection or BLE error - clean up client and record failure
-            _LOGGER.error(
-                "[DIAG] ✗ BLE error while reading sensors from %s: %s",
-                self.mac_address, err
-            )
-            self._circuit_breaker.record_failure()
-            # CRITICAL: Disconnect to free connection slot even on error
-            if self._client is not None:
-                try:
-                    await self.disconnect()
-                    _LOGGER.debug("[CONN] Disconnected after BLE error to free slot")
-                except Exception as disconnect_err:
-                    _LOGGER.debug("[CONN] Error during error-path disconnect: %s", disconnect_err)
-                self._client = None
-            raise
-        except Exception as err:
-            # Unexpected error - clean up and record failure
-            _LOGGER.error(
-                "[DIAG] ✗ Error while reading sensors from %s: %s",
-                self.mac_address, err, exc_info=True
-            )
-            self._circuit_breaker.record_failure()
-            # CRITICAL: Disconnect to free connection slot even on error
-            if self._client is not None:
-                try:
-                    await self.disconnect()
-                    _LOGGER.debug("[CONN] Disconnected after error to free slot")
-                except Exception as disconnect_err:
-                    _LOGGER.debug("[CONN] Error during error-path disconnect: %s", disconnect_err)
-                self._client = None
-            raise
+            _LOGGER.debug("[BUZZER] State query failed on %s: %s", self.mac_address, err)
+            return None
+        if frame is None:
+            _LOGGER.debug("[BUZZER] No state answer from %s", self.mac_address)
+            return None
+        return self.buzzer_state
+
+    # -- public API ---------------------------------------------------------
+
+    async def async_poll(self) -> EM1003PollResult:
+        """Read every sensor and the buzzer state over one single link."""
+        sensors: dict[int, float | int | None] = {sensor_id: None for sensor_id in SENSOR_TYPES}
+        buzzer: bool | None = None
+
+        def _any_sensor() -> bool:
+            return any(value is not None for value in sensors.values())
+
+        async def _body(client: Any) -> None:
+            nonlocal buzzer
+            await self._async_read_sensors(client, sensors)
+            buzzer = await self._async_query_buzzer(client)
+
+        result = await self._async_session(
+            _body, notify=True, gate=_GATE_CHECK, outcome_fn=_any_sensor
+        )
+
+        if not result.admitted:
+            return EM1003PollResult.failed(f"Circuit open for {self.mac_address}: {result.rejected_reason}")
+        if _any_sensor():
+            return EM1003PollResult(sensors=sensors, buzzer=buzzer, ok=True)
+        return EM1003PollResult.failed(
+            result.error or f"No sensor data from {self.mac_address}"
+        )
+
+    async def read_all_sensors(self) -> dict[int, float | int | None]:
+        """Read every sensor over one link. Never raises."""
+        sensors: dict[int, float | int | None] = {sensor_id: None for sensor_id in SENSOR_TYPES}
+
+        def _any_sensor() -> bool:
+            return any(value is not None for value in sensors.values())
+
+        async def _body(client: Any) -> None:
+            await self._async_read_sensors(client, sensors)
+
+        await self._async_session(_body, notify=True, gate=_GATE_CHECK, outcome_fn=_any_sensor)
+        return sensors
 
     async def read_buzzer_state(self) -> bool | None:
-        """Read current buzzer state.
+        """Query the buzzer state over its own link. Never raises."""
+        answered = False
+        state: bool | None = None
 
-        Returns:
-            True if buzzer is on, False if off, None if reading fails
-        """
-        # Check circuit breaker
-        can_attempt, reason = self._circuit_breaker.can_attempt()
-        if not can_attempt:
-            _LOGGER.warning(
-                "[CIRCUIT] Blocked read_buzzer_state: %s",
-                reason
-            )
-            return None
+        async def _body(client: Any) -> None:
+            nonlocal answered, state
+            seq_id = self._alloc_seq_id()
+            frame = await self._async_request(client, build_buzzer_query(seq_id), BUZZER_QUERY_KEY)
+            if frame is not None:
+                answered = True
+                state = self.buzzer_state
 
-        # Clean up expired requests
-        self._cleanup_expired_requests()
-
-        try:
-            # Ensure connection
-            client = await self._ensure_connected()
-
-            # Prepare request with random sequence ID
-            # Query buzzer state: [seq_id][0x50][0x00]
-            seq_id = self._get_random_sequence_id()
-            request = bytes([seq_id, CMD_BUZZER, 0x00])
-
-            hex_parts = ' '.join([f'{b:02x}' for b in request])
-            _LOGGER.debug(
-                "[TX] (查询蜂鸣器状态)[0x %s]",
-                hex_parts
-            )
-
-            # Create pending request and add to cache
-            pending_request = PendingRequest(
-                seq_id=seq_id,
-                sensor_id=0x00,  # Use 0x00 as placeholder for buzzer
-                future=asyncio.Future(),
-                timestamp=time.time()
-            )
-            request_key = (seq_id, 0x00)
-            self._pending_requests[request_key] = pending_request
-
-            # Send request
-            await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
-
-            # Wait for response with timeout
-            try:
-                await asyncio.wait_for(pending_request.future, timeout=2.0)
-                self._circuit_breaker.record_success()
-                return self.buzzer_state
-            except asyncio.TimeoutError:
-                _LOGGER.warning(
-                    "Timeout waiting for buzzer state response (seq=%02x)",
-                    seq_id
-                )
-                # Clean up pending request
-                self._pending_requests.pop(request_key, None)
-                self._used_seq_ids.discard(seq_id)
-                self._circuit_breaker.record_failure()
-                return None
-
-        except BleakError as err:
-            _LOGGER.error("Bleak error reading buzzer state: %s", err)
-            self._circuit_breaker.record_failure()
-            return None
-        except Exception as err:
-            _LOGGER.error("Error reading buzzer state: %s", err, exc_info=True)
-            self._circuit_breaker.record_failure()
-            return None
-        finally:
-            # CRITICAL: Disconnect after the query, same as read_all_sensors does.
-            # A link left open holds a connection slot, and a connected BLE
-            # peripheral stops advertising, so the device cannot be found again.
-            await self.disconnect()
+        await self._async_session(
+            _body, notify=True, gate=_GATE_CHECK, outcome_fn=lambda: answered
+        )
+        return state if answered else None
 
     async def set_buzzer_state(self, turn_on: bool) -> bool:
-        """Set buzzer state.
+        """Turn the buzzer on or off and verify the new state. Never raises.
 
-        Args:
-            turn_on: True to turn on buzzer, False to turn off
-
-        Returns:
-            True if successful, False otherwise
+        A user action, so it runs even while the breaker is open; a bypassed
+        attempt can only close the breaker, never extend an outage.
         """
-        # Check circuit breaker
-        can_attempt, reason = self._circuit_breaker.can_attempt()
-        if not can_attempt:
-            _LOGGER.warning(
-                "[CIRCUIT] Blocked set_buzzer_state: %s",
-                reason
+        verified = False
+
+        async def _body(client: Any) -> None:
+            nonlocal verified
+            seq_id = self._alloc_seq_id()
+            ack = await self._async_request(
+                client, build_buzzer_set(seq_id, turn_on), BUZZER_SET_KEY
             )
-            return False
-
-        # Clean up expired requests
-        self._cleanup_expired_requests()
-
-        try:
-            # Ensure connection
-            client = await self._ensure_connected()
-
-            # Prepare request with random sequence ID
-            # Set buzzer state: [seq_id][0x50][0x01][state]
-            seq_id = self._get_random_sequence_id()
-            state_byte = BUZZER_ON if turn_on else BUZZER_OFF
-            request = bytes([seq_id, CMD_BUZZER, 0x01, state_byte])
-
-            hex_parts = ' '.join([f'{b:02x}' for b in request])
-            _LOGGER.debug(
-                "[TX] (设置蜂鸣器状态)[0x %s] %s",
-                hex_parts,
-                "开启" if turn_on else "关闭"
-            )
-
-            # Create pending request and add to cache
-            pending_request = PendingRequest(
-                seq_id=seq_id,
-                sensor_id=0x01,  # Use 0x01 for buzzer set operation
-                future=asyncio.Future(),
-                timestamp=time.time()
-            )
-            request_key = (seq_id, 0x01)
-            self._pending_requests[request_key] = pending_request
-
-            # Send request
-            await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, request, response=False)
-
-            # Wait for response with timeout
-            try:
-                await asyncio.wait_for(pending_request.future, timeout=2.0)
-
-                # Set command received, now query to verify the actual state
-                # The set response may not contain reliable state info, so we query separately
-                _LOGGER.debug("[BUZZER] Set command acknowledged, querying actual state...")
-
-                # Small delay to allow device to process the command
-                await asyncio.sleep(0.1)
-
-                # Query current state
-                query_seq_id = self._get_random_sequence_id()
-                query_request = bytes([query_seq_id, CMD_BUZZER, 0x00])
-
-                query_hex = ' '.join([f'{b:02x}' for b in query_request])
-                _LOGGER.debug("[TX] (验证蜂鸣器状态)[0x %s]", query_hex)
-
-                # Create pending request for query
-                query_pending = PendingRequest(
-                    seq_id=query_seq_id,
-                    sensor_id=0x00,
-                    future=asyncio.Future(),
-                    timestamp=time.time()
+            if ack is None:
+                _LOGGER.error(
+                    "[BUZZER] %s did not acknowledge the set command", self.mac_address
                 )
-                query_key = (query_seq_id, 0x00)
-                self._pending_requests[query_key] = query_pending
+                return
 
-                # Send query request
-                await client.write_gatt_char(EM1003_WRITE_CHAR_UUID, query_request, response=False)
+            await asyncio.sleep(const.BLE_BUZZER_SETTLE_DELAY)
 
-                # Wait for query response
-                await asyncio.wait_for(query_pending.future, timeout=2.0)
-
-                # Now verify the state
-                if self.buzzer_state == turn_on:
-                    _LOGGER.info(
-                        "[BUZZER] ✓ Successfully %s buzzer (verified)",
-                        "turned on" if turn_on else "turned off"
-                    )
-                    self._circuit_breaker.record_success()
-                    return True
-                else:
-                    _LOGGER.warning(
-                        "[BUZZER] ✗ State mismatch after verification: expected %s, got %s",
-                        turn_on, self.buzzer_state
-                    )
-                    self._circuit_breaker.record_failure()
-                    return False
-
-            except asyncio.TimeoutError:
-                _LOGGER.warning(
-                    "Timeout waiting for buzzer response (set seq=%02x)",
-                    seq_id
+            query_seq_id = self._alloc_seq_id()
+            frame = await self._async_request(
+                client, build_buzzer_query(query_seq_id), BUZZER_QUERY_KEY
+            )
+            if frame is None:
+                _LOGGER.error(
+                    "[BUZZER] %s did not confirm the new state", self.mac_address
                 )
-                # Clean up any pending requests
-                self._pending_requests.pop((seq_id, 0x01), None)
-                self._used_seq_ids.discard(seq_id)
-                # Also clean up query request if it exists
-                if 'query_seq_id' in locals():
-                    self._pending_requests.pop((query_seq_id, 0x00), None)
-                    self._used_seq_ids.discard(query_seq_id)
-                self._circuit_breaker.record_failure()
-                return False
+                return
 
-        except BleakError as err:
-            _LOGGER.error("Bleak error setting buzzer state: %s", err)
-            self._circuit_breaker.record_failure()
-            return False
-        except Exception as err:
-            _LOGGER.error("Error setting buzzer state: %s", err, exc_info=True)
-            self._circuit_breaker.record_failure()
-            return False
-        finally:
-            # CRITICAL: Disconnect after the command, same as read_all_sensors does.
-            # A link left open holds a connection slot, and a connected BLE
-            # peripheral stops advertising, so the device cannot be found again.
-            await self.disconnect()
+            verified = self.buzzer_state == turn_on
+            if not verified:
+                _LOGGER.error(
+                    "[BUZZER] %s reports %s after being told %s",
+                    self.mac_address,
+                    self.buzzer_state,
+                    turn_on,
+                )
+
+        await self._async_session(
+            _body, notify=True, gate=_GATE_BYPASS, outcome_fn=lambda: verified
+        )
+        return verified
+
+    async def async_read_device_name(self) -> str | None:
+        """Read the GATT device name. Never raises, never touches the breaker."""
+        name: str | None = None
+
+        async def _body(client: Any) -> None:
+            nonlocal name
+            async with asyncio.timeout(const.BLE_READ_CHAR_TIMEOUT):
+                raw = await client.read_gatt_char(DEVICE_NAME_UUID)
+            text = bytes(raw).decode("utf-8", errors="replace").replace("\x00", "").strip()
+            name = text or None
+
+        await self._async_session(_body, notify=False, gate=_GATE_NONE)
+        return name
+
+    async def async_with_client(
+        self,
+        func: Callable[[Any], Awaitable[Any]],
+        *,
+        notify: bool = False,
+        timeout: float | None = None,
+        use_breaker: bool = False,
+    ) -> Any:
+        """Run ``func(client)`` on a link of this device, then close it.
+
+        Every BLE connection of the integration goes through here, so the
+        debug services share this device's lock and its single patch point.
+        Raises :class:`BleakError` when the link cannot be made, and re-raises
+        whatever ``func`` raised once the link has been closed.
+        """
+        result = await self._async_session(
+            func,
+            notify=notify,
+            timeout=timeout,
+            gate=_GATE_CHECK if use_breaker else _GATE_NONE,
+            raise_errors=True,
+        )
+        if not result.admitted:
+            raise BleakError(
+                f"Circuit open for {self.mac_address}: {result.rejected_reason}"
+            )
+        return result.value
+
+    async def disconnect(self) -> None:
+        """Close any lingering link. Never raises.
+
+        Waits for an in-flight session, so it must never be called from inside
+        one.
+        """
+        async with self._lock:
+            client = self._client
+            if client is None:
+                self._client = None
+                _LOGGER.debug("[CONN] %s already disconnected", self.mac_address)
+                return
+            await self._async_close(client, True)

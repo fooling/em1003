@@ -2,7 +2,7 @@
   "name": "EM1003 BLE Sensor (720环境宝3)",
   "content_in_root": false,
   "filename": "em1003",
-  "homeassistant": "2023.1.0",
+  "homeassistant": "2024.12.0",
   "render_readme": true,
   "domains": ["sensor"],
   "iot_class": "Local Polling"

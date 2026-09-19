@@ -12,6 +12,8 @@
 
 ### 1. 安装方式
 
+> **系统要求**：Home Assistant **2024.12.0** 或更高版本。低于此版本的 Home Assistant 请继续使用 1.0.3（HACS 不会向其推送新版本）。
+
 #### 通过 HACS 安装（推荐）
 
 > **注意**：此项目尚未加入HACS官方存储库，需要手动添加自定义存储库。
@@ -118,6 +120,8 @@ ESP32 (Bluetooth Proxy)
 A Home Assistant custom integration for the **EM1003 BLE Sensor** (720 Air Quality Monitor). Supports 8 sensors: Temperature, Humidity, Noise, PM2.5, PM10, Formaldehyde, TVOC, and eCO2.
 
 ### 1. Installation
+
+> **Requirements**: Home Assistant **2024.12.0** or newer. Older cores should stay on 1.0.3 — HACS will not offer them a newer version.
 
 #### Install via HACS (Recommended)
 

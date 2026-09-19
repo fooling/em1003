@@ -1,7 +1,6 @@
 """Sensor platform for EM1003 BLE Sensor integration."""
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timedelta
 
@@ -14,13 +13,10 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import (
-    CoordinatorEntity,
-    DataUpdateCoordinator,
-    UpdateFailed,
-)
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, CONF_MAC_ADDRESS, SENSOR_TYPES, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
+from .const import DOMAIN, CONF_MAC_ADDRESS, SENSOR_TYPES
+from .coordinator import EM1003DataUpdateCoordinator  # noqa: F401  (re-export, see below)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -34,113 +30,23 @@ async def async_setup_entry(
     data = hass.data[DOMAIN][config_entry.entry_id]
     mac_address = data[CONF_MAC_ADDRESS]
     device_name = data.get("device_name", config_entry.title)
-    em1003_device = data["device"]
+    coordinator: EM1003DataUpdateCoordinator = data["coordinator"]
 
     _LOGGER.info("Setting up EM1003 sensors for device: %s (%s)", device_name, mac_address)
 
-    # Get scan interval from options or use default
-    scan_interval_seconds = config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-    scan_interval = timedelta(seconds=scan_interval_seconds)
-    _LOGGER.info("Using scan interval: %d seconds", scan_interval_seconds)
-
-    # Create coordinator for updating sensor data
-    coordinator = EM1003DataUpdateCoordinator(hass, em1003_device, mac_address, scan_interval)
-
-    # Store coordinator in hass.data so switch can access it
-    hass.data[DOMAIN][config_entry.entry_id]["coordinator"] = coordinator
-
-    # Add a small delay before first refresh to allow device to be ready
-    _LOGGER.debug("Waiting for device to be ready before initial refresh...")
-    await asyncio.sleep(2.0)
-
-    # Fetch initial data with better error handling
-    try:
-        await coordinator.async_config_entry_first_refresh()
-    except Exception as err:
-        _LOGGER.warning(
-            "Initial data fetch failed for %s, sensors will retry automatically: %s",
+    entities = [
+        EM1003Sensor(
+            coordinator,
+            config_entry,
             mac_address,
-            err
+            device_name,
+            sensor_id,
+            sensor_info,
         )
-        # Don't fail setup - let sensors show unavailable and retry later
-
-    # Create sensor entities for each sensor type
-    entities = []
-    for sensor_id, sensor_info in SENSOR_TYPES.items():
-        entities.append(
-            EM1003Sensor(
-                coordinator,
-                config_entry,
-                mac_address,
-                device_name,
-                sensor_id,
-                sensor_info,
-            )
-        )
+        for sensor_id, sensor_info in SENSOR_TYPES.items()
+    ]
 
     async_add_entities(entities)
-
-
-class EM1003DataUpdateCoordinator(DataUpdateCoordinator):
-    """Class to manage fetching EM1003 data from the device."""
-
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        em1003_device,
-        mac_address: str,
-        update_interval: timedelta,
-    ) -> None:
-        """Initialize the coordinator."""
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=f"EM1003 {mac_address}",
-            update_interval=update_interval,
-        )
-        self.em1003_device = em1003_device
-        self.mac_address = mac_address
-
-    async def _async_update_data(self) -> dict:
-        """Fetch data from the device."""
-        try:
-            _LOGGER.debug("Updating sensor data for %s", self.mac_address)
-            data = await self.em1003_device.read_all_sensors()
-
-            # Also update buzzer state periodically to keep switch in sync
-            # This prevents the switch from staying unavailable if state gets out of sync
-            try:
-                _LOGGER.debug("Querying buzzer state for %s", self.mac_address)
-                buzzer_state = await self.em1003_device.read_buzzer_state()
-                if buzzer_state is not None:
-                    _LOGGER.debug("Buzzer state updated: %s", "ON" if buzzer_state else "OFF")
-            except Exception as buzzer_err:
-                _LOGGER.debug("Could not update buzzer state: %s", buzzer_err)
-                # Don't fail the entire update if buzzer query fails
-
-            # Check if we actually received any valid data
-            valid_count = sum(1 for v in data.values() if v is not None)
-            if valid_count == 0:
-                raise UpdateFailed(
-                    f"Failed to read any sensor data from {self.mac_address} - "
-                    "connection or device issue"
-                )
-
-            _LOGGER.debug("Sensor data updated: %s (valid: %d/%d)", data, valid_count, len(data))
-
-            # Log if problematic sensors have no data
-            if data:
-                for sensor_id in [0x11, 0x12, 0x13]:  # PM10, TVOC, eCO2
-                    value = data.get(sensor_id)
-                    if value is None:
-                        from .const import SENSOR_TYPES
-                        sensor_info = SENSOR_TYPES.get(sensor_id, {})
-                        sensor_name = sensor_info.get("name", f"0x{sensor_id:02x}")
-                        _LOGGER.info("[%s] No data received", sensor_name)
-
-            return data
-        except Exception as err:
-            raise UpdateFailed(f"Error communicating with device: {err}") from err
 
 
 class EM1003Sensor(CoordinatorEntity, SensorEntity):
@@ -182,7 +88,11 @@ class EM1003Sensor(CoordinatorEntity, SensorEntity):
                 "humidity": getattr(SensorDeviceClass, "HUMIDITY", None),
                 "pm25": getattr(SensorDeviceClass, "PM25", None),
                 "pm10": getattr(SensorDeviceClass, "PM10", None),
-                "carbon_dioxide": getattr(SensorDeviceClass, "CARBON_DIOXIDE", None),
+                # Current HA names this member CO2 (its *value* is still
+                # "carbon_dioxide"); older versions used CARBON_DIOXIDE.
+                "carbon_dioxide": getattr(
+                    SensorDeviceClass, "CO2", getattr(SensorDeviceClass, "CARBON_DIOXIDE", None)
+                ),
                 "volatile_organic_compounds": getattr(SensorDeviceClass, "VOLATILE_ORGANIC_COMPOUNDS", None),
             }
             self._attr_device_class = device_class_map.get(device_class_str)

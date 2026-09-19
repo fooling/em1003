@@ -37,6 +37,25 @@ class EM1003ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Initialize the config flow."""
         self._discovered_devices: dict[str, BluetoothServiceInfoBleak] = {}
 
+    def _mac_already_configured(self, mac_address: str) -> bool:
+        """Is this MAC already covered by an existing entry, ignoring case?
+
+        ``async_set_unique_id`` / ``_abort_if_unique_id_configured`` only
+        catch an *exact* string match (BC-22), so a legacy entry whose
+        ``mac_address``/``unique_id`` was stored lowercase is invisible to
+        them when HA/BlueZ hands us the uppercase address. Read-only: the
+        existing entry's unique_id and data are never rewritten.
+        """
+        wanted = mac_address.upper()
+        for existing_entry in self._async_current_entries():
+            for candidate in (
+                existing_entry.data.get(CONF_MAC_ADDRESS),
+                existing_entry.unique_id,
+            ):
+                if candidate and candidate.upper() == wanted:
+                    return True
+        return False
+
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
     ) -> FlowResult:
@@ -44,6 +63,8 @@ class EM1003ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         _LOGGER.debug("Discovered BLE device: %s", discovery_info)
         await self.async_set_unique_id(discovery_info.address)
         self._abort_if_unique_id_configured()
+        if self._mac_already_configured(discovery_info.address):
+            return self.async_abort(reason="already_configured")
 
         self._discovered_devices[discovery_info.address] = discovery_info
 
@@ -72,11 +93,15 @@ class EM1003ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            mac_address = user_input[CONF_MAC_ADDRESS].upper().replace("-", ":")
+            mac_address = user_input[CONF_MAC_ADDRESS].strip().upper().replace("-", ":")
 
             # Set unique ID to prevent duplicate entries
             await self.async_set_unique_id(mac_address)
             self._abort_if_unique_id_configured()
+
+            # Guard against a legacy entry whose MAC was stored lowercase (BC-22).
+            if self._mac_already_configured(mac_address):
+                return self.async_abort(reason="already_configured")
 
             # Try to read device name from the BLE device
             _LOGGER.info("Attempting to read device name from %s", mac_address)
@@ -131,17 +156,18 @@ class EM1003ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     @staticmethod
-    def async_get_options_flow(config_entry: config_entries.ConfigEntry):
+    def async_get_options_flow(config_entry: config_entries.ConfigEntry) -> EM1003OptionsFlow:
         """Get the options flow for this handler."""
-        return EM1003OptionsFlow(config_entry)
+        return EM1003OptionsFlow()
 
 
 class EM1003OptionsFlow(config_entries.OptionsFlow):
-    """Handle options flow for EM1003."""
+    """Handle options flow for EM1003.
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialize options flow."""
-        self.config_entry = config_entry
+    No ``__init__`` here: ``config_entry`` is a read-only property on the
+    base ``OptionsFlow`` on current Home Assistant, and assigning to it
+    raises. The base class resolves it from the flow's handler id.
+    """
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None

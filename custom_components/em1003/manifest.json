@@ -3,12 +3,12 @@
   "name": "EM1003 BLE Sensor (720环境宝3)",
   "codeowners": [],
   "config_flow": true,
-  "dependencies": [],
-  "documentation": "https://github.com/yourusername/em1003",
+  "dependencies": ["bluetooth_adapters"],
+  "documentation": "https://github.com/fooling/em1003",
   "integration_type": "device",
   "iot_class": "local_polling",
   "requirements": ["bleak>=0.21.0", "bleak-retry-connector>=3.5.0"],
-  "version": "1.0.3",
+  "version": "1.1.0",
   "bluetooth": [
     {
       "local_name": "EM1003*"
